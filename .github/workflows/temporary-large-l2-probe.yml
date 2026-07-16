@@ -1,4 +1,4 @@
-name: Temporary abicheck main large L2 probe
+name: Temporary abicheck main CastXML start probe
 
 on:
   pull_request:
@@ -9,16 +9,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: temporary-abicheck-large-l2-${{ github.event.pull_request.number }}
+  group: temporary-abicheck-castxml-start-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   profile:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       ABICHECK_MAIN_SHA: 488f823cd58459307d969d92b9c5567d590043fd
-      ABICHECK_PROBE_SHA: c89c666feda7c2b1f79e1ca377decfa49e00f3ae
+      ABICHECK_PROBE_SHA: 4caf8e83fb9f15f53fa546d6f34eaacc35fc7fb6
       PYTHONHASHSEED: "0"
     steps:
       - uses: actions/checkout@v6
@@ -27,9 +27,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            castxml clang cmake curl gcc g++ git jq libclang-dev libeigen3-dev \
-            libjemalloc2 libssl-dev libtbb-dev llvm-dev ninja-build strace time \
-            unzip xz-utils
+            castxml clang cmake gcc g++ git libclang-dev libeigen3-dev libjemalloc2 \
+            libtbb-dev llvm-dev ninja-build
 
       - name: Checkout exact abicheck main plus profiling-only script
         run: |
@@ -38,10 +37,9 @@ jobs:
           git -C /tmp/abicheck fetch --no-tags origin main
           test "$(git -C /tmp/abicheck rev-parse origin/main)" = "$ABICHECK_MAIN_SHA"
           git -C /tmp/abicheck diff --exit-code "$ABICHECK_MAIN_SHA" -- abicheck pyproject.toml
-          python -m py_compile /tmp/abicheck/scripts/profile_large_l2_castxml_v3.py
+          python -m py_compile /tmp/abicheck/scripts/profile_castxml_start_semantics.py
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -49,18 +47,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e /tmp/abicheck
-          python - <<'PY'
-          import abicheck, pathlib
-          print(pathlib.Path(abicheck.__file__).resolve())
-          PY
-          castxml --version
-          gcc --version | head -1
-          clang --version | head -1
-          llvm-config --version
-          free -h
 
       - name: Build current CastXML source against system LLVM
-        continue-on-error: true
         run: |
           set -euxo pipefail
           git clone --depth 1 https://github.com/CastXML/CastXML.git /tmp/CastXML-src
@@ -76,25 +64,20 @@ jobs:
           test -n "$bin"
           "$bin" --version
           echo "CASTXML_NEW_BIN=$bin" >> "$GITHUB_ENV"
-          echo "CASTXML_NEW_SHA=$(git -C /tmp/CastXML-src rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Run profiler
+      - name: Run start-root semantic and allocator benchmark
         run: |
           mkdir -p results
-          set +e
-          python /tmp/abicheck/scripts/profile_large_l2_castxml_v3.py \
-            --main-sha "$ABICHECK_MAIN_SHA" \
-            --out-dir results \
-            >results/probe-v3.log 2>&1
-          rc=$?
-          cat results/probe-v3.log
-          exit "$rc"
+          python /tmp/abicheck/scripts/profile_castxml_start_semantics.py \
+            --out results/castxml-start-semantics.json \
+            >results/probe.log 2>&1
+          cat results/probe.log
 
       - name: Upload profiling artifact
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: abicheck-main-488f823-large-l2-v3
+          name: abicheck-main-488f823-castxml-start-semantics
           path: results/
           if-no-files-found: warn
           retention-days: 7
