@@ -1,0 +1,101 @@
+name: Temporary abicheck main large L2 probe
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/temporary-large-l2-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-abicheck-large-l2-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ABICHECK_MAIN_SHA: 488f823cd58459307d969d92b9c5567d590043fd
+      ABICHECK_PROBE_SHA: c89c666feda7c2b1f79e1ca377decfa49e00f3ae
+      PYTHONHASHSEED: "0"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            castxml clang cmake curl gcc g++ git jq libclang-dev libeigen3-dev \
+            libjemalloc2 libssl-dev libtbb-dev llvm-dev ninja-build strace time \
+            unzip xz-utils
+
+      - name: Checkout exact abicheck main plus profiling-only script
+        run: |
+          git clone https://github.com/abicheck/abicheck.git /tmp/abicheck
+          git -C /tmp/abicheck checkout "$ABICHECK_PROBE_SHA"
+          git -C /tmp/abicheck fetch --no-tags origin main
+          test "$(git -C /tmp/abicheck rev-parse origin/main)" = "$ABICHECK_MAIN_SHA"
+          git -C /tmp/abicheck diff --exit-code "$ABICHECK_MAIN_SHA" -- abicheck pyproject.toml
+          python -m py_compile /tmp/abicheck/scripts/profile_large_l2_castxml_v3.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install exact current-main source
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e /tmp/abicheck
+          python - <<'PY'
+          import abicheck, pathlib
+          print(pathlib.Path(abicheck.__file__).resolve())
+          PY
+          castxml --version
+          gcc --version | head -1
+          clang --version | head -1
+          llvm-config --version
+          free -h
+
+      - name: Build current CastXML source against system LLVM
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/CastXML/CastXML.git /tmp/CastXML-src
+          llvm_dir="$(llvm-config --cmakedir)"
+          clang_config="$(find /usr/lib/llvm-* -path '*/lib/cmake/clang/ClangConfig.cmake' | sort -V | tail -1)"
+          test -n "$clang_config"
+          cmake -S /tmp/CastXML-src -B /tmp/CastXML-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="$llvm_dir" \
+            -DClang_DIR="$(dirname "$clang_config")"
+          cmake --build /tmp/CastXML-build --target castxml -- -j2
+          bin="$(find /tmp/CastXML-build -type f -name castxml -perm -111 | head -1)"
+          test -n "$bin"
+          "$bin" --version
+          echo "CASTXML_NEW_BIN=$bin" >> "$GITHUB_ENV"
+          echo "CASTXML_NEW_SHA=$(git -C /tmp/CastXML-src rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Run profiler
+        run: |
+          mkdir -p results
+          set +e
+          python /tmp/abicheck/scripts/profile_large_l2_castxml_v3.py \
+            --main-sha "$ABICHECK_MAIN_SHA" \
+            --out-dir results \
+            >results/probe-v3.log 2>&1
+          rc=$?
+          cat results/probe-v3.log
+          exit "$rc"
+
+      - name: Upload profiling artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: abicheck-main-488f823-large-l2-v3
+          path: results/
+          if-no-files-found: warn
+          retention-days: 7
