@@ -1,0 +1,107 @@
+        "library_count": len(libraries), "libraries": libraries,
+        "scan_count": len(scans),
+        "exact_full_header_scan_successes": exact_full_ok,
+        "clang_integrated_full_header_scan_successes": clang_full_ok,
+        "full_header_scan_successes": full_ok,
+        "header_selected_snapshot_successes": header_selected_ok,
+        "selected_snapshot_successes": selected_ok,
+        "scan_records": scans,
+        "total_recorded_wall_seconds": round(sum(x.wall_seconds for x in runner.records), 6),
+        "timing_record_count": len(runner.records),
+        "fatal_error": fatal_error,
+        "status": "failed" if fatal_error or (not libraries) or selected_ok == 0 else ("partial" if full_ok < len(libraries) else "complete"),
+    }
+    (result_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    lines = [
+        f"# abicheck scan: {target}", "",
+        f"- Status: **{summary['status']}**",
+        f"- Repository/ref: `{config['repo']}` @ `{config['ref']}`",
+        f"- Resolved commit: `{commit}`",
+        f"- Clang: `{summary['clang_version']}`",
+        f"- abicheck: `{summary['abicheck_version']}`",
+        f"- Shared libraries discovered: **{len(libraries)}**",
+        f"- Exact build-context full-header scans succeeded: **{exact_full_ok}/{len(libraries)}**",
+        f"- Clang-integrated compatibility full-header scans succeeded: **{clang_full_ok}/{len(libraries)}**",
+        f"- Full public-header directory scans succeeded: **{full_ok}/{len(libraries)}**",
+        f"- Selected header-derived snapshots: **{header_selected_ok}/{len(libraries)}**",
+        f"- Usable selected snapshots: **{selected_ok}/{len(libraries)}**",
+        f"- Recorded command wall time: **{summary['total_recorded_wall_seconds']:.3f} s**",
+    ]
+    if source_metrics:
+        cdb = source_metrics.get("compile_db", {})
+        lines += [
+            f"- Source/header files inventoried: **{source_metrics.get('files', 0)}**",
+            f"- Lines inventoried: **{source_metrics.get('lines', 0):,}**",
+            f"- Public headers: **{source_metrics.get('public_header_count', 0)}**",
+            f"- compile_commands entries: **{cdb.get('entry_count', 0)}**",
+            f"- compile_commands compilers: `{json.dumps(cdb.get('compilers', {}), sort_keys=True)}`",
+        ]
+    if fatal_error:
+        lines += ["", "## Fatal error", "", f"```text\n{fatal_error}\n```"]
+    lines += ["", "## Libraries", ""]
+    for row in libraries:
+        lines.append(f"- `{row['name']}` — {row['bytes']:,} bytes; {row['defined_dynamic_symbols']} defined dynamic symbols; DWARF={row['has_dwarf']}")
+    lines += ["", "## Scan modes", ""]
+    for rec in scans:
+        modes = ", ".join(f"{a['mode']}={a['exit_code']}" for a in rec.get("attempts", []))
+        lines.append(f"- `{rec['library_name']}`: {modes}; selected={bool(rec.get('selected_snapshot'))}")
+    (result_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", required=True, choices=sorted(TARGETS))
+    parser.add_argument("--output-root", type=Path, default=Path("abicheck-results"))
+    args = parser.parse_args()
+
+    target = args.target
+    config = TARGETS[target]
+    result_dir = args.output_root.resolve() / target
+    work_root = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"abicheck-{target}"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    work_root.mkdir(parents=True, exist_ok=True)
+    runner = Runner(result_dir)
+    write_environment(result_dir)
+    src = work_root / "src"
+    build = work_root / "build"
+    install = work_root / "install"
+    source_metrics: dict[str, Any] | None = None
+    library_rows: list[dict[str, Any]] = []
+    scan_records: list[dict[str, Any]] = []
+    fatal_error: str | None = None
+    try:
+        src = clone_repo(runner, config, work_root)
+        build, install, header_root, include_dirs = build_target(target, runner, src, work_root)
+        compile_db = build / "compile_commands.json"
+        if not compile_db.exists():
+            raise RuntimeError(f"Clang build did not produce {compile_db}")
+        source_metrics = collect_source_inventory(src, header_root, compile_db, result_dir)
+        libraries = discover_libraries(target, src, build, install)
+        if not libraries:
+            raise RuntimeError("No non-test ELF shared libraries were discovered after build")
+        library_rows = collect_libraries(libraries, result_dir)
+        preserve_build_metadata(target, src, build, install, result_dir)
+        scan_records = run_abicheck_scans(
+            target, config, runner, src, build, install, header_root,
+            include_dirs, libraries, result_dir,
+        )
+    except Exception as exc:
+        fatal_error = f"{type(exc).__name__}: {exc}"
+        (result_dir / "fatal_error.txt").write_text(fatal_error + "\n", encoding="utf-8")
+    finally:
+        runner.flush_timings()
+        build_summary(target, config, src, result_dir, source_metrics, library_rows, scan_records, runner, fatal_error)
+        manifest = {
+            "script": Path(__file__).name,
+            "script_sha256": sha256_file(Path(__file__)),
+            "target_config": config,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    # Return zero so artifact upload and aggregation always execute. Status is explicit in summary.json.
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
