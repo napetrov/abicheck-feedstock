@@ -1,4 +1,4 @@
-name: abicheck main verified oneAPI L0-L5 scans
+name: abicheck main oneTBB public-header fix verification
 
 on:
   pull_request:
@@ -43,9 +43,9 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 1
       matrix:
-        target: [onedal, onetbb, onednn, level-zero]
+        target: [onetbb]
     steps:
       - name: Checkout orchestration
         uses: actions/checkout@v4
@@ -61,7 +61,7 @@ jobs:
           set -euxo pipefail
           base64 -d ci/run_abicheck_main_v2.py.gz.b64 | gzip -dc > ci/run_abicheck_main_v2.py
           base64 -d ci/aggregate_abicheck_main_v2.py.gz.b64 | gzip -dc > ci/aggregate_abicheck_main_v2.py
-          echo "60192324ef1cbb49b16628969c94d547805e34359c7abec58e64c71fa7cb5f5c  ci/run_abicheck_main_v2.py" | sha256sum -c -
+          echo "54101c33293d9c90a42ee5b316a4eeadae41d65a2ffe8f7a92b5969d62d662e1  ci/run_abicheck_main_v2.py" | sha256sum -c -
           echo "fc5e49dcec2e7fc8277b7d674b682c0de9044ad9fe578807aaecf61c8421cdb7  ci/aggregate_abicheck_main_v2.py" | sha256sum -c -
           python -m py_compile ci/run_abicheck_main_v2.py ci/aggregate_abicheck_main_v2.py
 
@@ -185,8 +185,8 @@ jobs:
           PY
 
   aggregate:
-    name: aggregate and verify all evidence
-    if: always()
+    name: aggregate disabled for focused retry
+    if: ${{ false }}
     needs: [resolve, scan]
     runs-on: ubuntu-24.04
     steps:
