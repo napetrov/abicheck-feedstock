@@ -1,0 +1,171 @@
+name: abicheck main oneAPI full-source scans
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/abicheck-main-source-scan.yml"
+      - "ci/run_abicheck_main_scan.py.part-*"
+      - "ci/aggregate_abicheck_main.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: abicheck-main-oneapi-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ABICHECK_BUILD_JOBS: "2"
+  ABICHECK_L4_JOBS: "2"
+  ABICHECK_CALL_GRAPH_JOBS: "2"
+  ABICHECK_PATTERN_SCAN_JOBS: "2"
+
+jobs:
+  resolve-abicheck-main:
+    name: resolve abicheck main
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve one immutable main commit
+        id: resolve
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sha="$(git ls-remote --exit-code https://github.com/abicheck/abicheck.git refs/heads/main | awk '{print $1}')"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$sha"
+
+  scan:
+    name: ${{ matrix.target }}
+    needs: resolve-abicheck-main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: [onedal, onetbb, onednn, level-zero]
+
+    steps:
+      - name: Checkout orchestration
+        uses: actions/checkout@v4
+
+      - name: Reassemble and verify the scan harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat ci/run_abicheck_main_scan.py.part-* > ci/run_abicheck_main_scan.py
+          echo "5d7c84a326e11fee155aafeb9d185a60f5920bfea754767ba59e7d70a0a4bf7b  ci/run_abicheck_main_scan.py" | sha256sum -c -
+          python -m py_compile ci/run_abicheck_main_scan.py ci/aggregate_abicheck_main.py
+
+      - name: Install Clang, build, and inspection tooling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git time clang lld cmake ninja-build make bear \
+            binutils file jq zstd gzip patchelf pkg-config dpkg-dev \
+            libtbb-dev libhwloc-dev libopenblas-dev liblapacke-dev \
+            libspdlog-dev libfmt-dev python3-dev python3-pip
+          sudo rm -rf /var/lib/apt/lists/*
+          clang --version
+          clang++ --version
+          cmake --version
+          ninja --version
+          bear --version
+
+      - name: Install the exact resolved abicheck main commit
+        shell: bash
+        env:
+          ABICHECK_SHA: ${{ needs.resolve-abicheck-main.outputs.sha }}
+        run: |
+          set -euxo pipefail
+          ABICHECK_SRC="$RUNNER_TEMP/abicheck-main"
+          git init "$ABICHECK_SRC"
+          git -C "$ABICHECK_SRC" remote add origin https://github.com/abicheck/abicheck.git
+          git -C "$ABICHECK_SRC" fetch --depth=1 origin "$ABICHECK_SHA"
+          git -C "$ABICHECK_SRC" checkout --detach FETCH_HEAD
+          test "$(git -C "$ABICHECK_SRC" rev-parse HEAD)" = "$ABICHECK_SHA"
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir "$ABICHECK_SRC"
+          abicheck --version
+          abicheck dump --help >/dev/null
+          echo "ABICHECK_MAIN_SOURCE=$ABICHECK_SRC" >> "$GITHUB_ENV"
+
+      - name: Build with Clang and collect L0-L5 full-source evidence
+        id: scan
+        continue-on-error: true
+        shell: bash
+        env:
+          ABICHECK_SHA: ${{ needs.resolve-abicheck-main.outputs.sha }}
+        run: |
+          set -o pipefail
+          python ci/run_abicheck_main_scan.py \
+            --target "${{ matrix.target }}" \
+            --abicheck-sha "$ABICHECK_SHA" \
+            --output-root "$GITHUB_WORKSPACE/abicheck-main-results" \
+            --jobs "$ABICHECK_BUILD_JOBS"
+
+      - name: Publish target summary
+        if: always()
+        shell: bash
+        run: |
+          summary="abicheck-main-results/${{ matrix.target }}/summary.md"
+          if [[ -f "$summary" ]]; then
+            cat "$summary"
+            cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No target summary was produced." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload complete target evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abicheck-main-${{ matrix.target }}
+          path: abicheck-main-results/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+  aggregate:
+    name: aggregate all evidence
+    if: always()
+    needs: [resolve-abicheck-main, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout orchestration
+        uses: actions/checkout@v4
+
+      - name: Verify the aggregation harness
+        run: python -m py_compile ci/aggregate_abicheck_main.py
+
+      - name: Download target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: abicheck-main-*
+          path: downloaded
+
+      - name: Build combined report and evidence bundle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python ci/aggregate_abicheck_main.py \
+            --input downloaded \
+            --output combined
+          cat combined/summary.md
+          cat combined/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: abicheck-main-oneapi-combined
+          path: combined
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
