@@ -1,0 +1,211 @@
+        if source.exists():
+            os.symlink(source, tbb / "include" / name, target_is_directory=True)
+
+    system_lib = Path("/usr/lib") / multiarch
+    for candidate in sorted(system_lib.glob("libtbb*.so*")):
+        dest = tbb / "lib" / candidate.name
+        if not dest.exists():
+            os.symlink(candidate, dest)
+
+    header_candidates = [
+        Path("/usr/include") / multiarch / "openblas-pthread",
+        Path("/usr/include") / multiarch / "openblas-openmp",
+        Path("/usr/include") / multiarch / "openblas",
+        Path("/usr/include/openblas"),
+    ]
+    header_root = first_existing(header_candidates)
+    if header_root is None:
+        # Some distributions put cblas.h directly below /usr/include/<multiarch>.
+        header_root = Path("/usr/include") / multiarch
+    for name in ("cblas.h", "f77blas.h", "openblas_config.h"):
+        candidate = header_root / name
+        if candidate.exists():
+            os.symlink(candidate, openblas / "include" / name)
+
+    lib_candidates = [
+        system_lib / "libopenblas.a",
+        *sorted(system_lib.glob("openblas-*/libopenblas.a")),
+    ]
+    openblas_lib = first_existing(lib_candidates)
+    if openblas_lib is None:
+        raise HarnessError("could not locate static libopenblas.a")
+    os.symlink(openblas_lib, openblas / "lib/libopenblas.a")
+
+    env["TBBROOT"] = str(tbb)
+    env["OPENBLASROOT"] = str(openblas)
+    env["LD_LIBRARY_PATH"] = f"{tbb / 'lib'}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":")
+    manifest = {
+        "multiarch": multiarch,
+        "tbbroot": str(tbb),
+        "openblasroot": str(openblas),
+        "tbb_entries": [str(p) for p in sorted(tbb.rglob("*"))],
+        "openblas_entries": [str(p) for p in sorted(openblas.rglob("*"))],
+        "environment": {
+            "TBBROOT": env["TBBROOT"],
+            "OPENBLASROOT": env["OPENBLASROOT"],
+            "LD_LIBRARY_PATH": env["LD_LIBRARY_PATH"],
+        },
+    }
+    json_dump(output, manifest)
+
+
+
+def configure_build_integration(
+    target: Target,
+    src: Path,
+    work: Path,
+    public_dirs: Sequence[Path],
+    env: dict[str, str],
+    output: Path,
+) -> Path:
+    """Configure abicheck-cc as an argv-transparent Clang build integration."""
+    pack = work / "abicheck_inputs"
+    env.update(
+        {
+            "ABICHECK_INPUTS_DIR": str(pack),
+            "ABICHECK_CC_EXTRACTOR": "clang",
+            "ABICHECK_CC_HEADERS": os.pathsep.join(str(p) for p in public_dirs),
+            "ABICHECK_CC_LIBRARY": target.name,
+            "ABICHECK_CC_VERSION": target.ref,
+        }
+    )
+    config = {
+        "producer": "abicheck-cc",
+        "extractor": "clang",
+        "pack": str(pack),
+        "public_roots": [str(p) for p in public_dirs],
+        "library": target.name,
+        "version": target.ref,
+    }
+    if target.build_kind == "onedal":
+        # oneDAL's makefiles invoke the literal clang/clang++ names instead of
+        # respecting CMAKE launcher variables. Put argv-transparent shims first
+        # on PATH; each shim invokes the real compiler through abicheck-cc.
+        shim_dir = work / "compiler-launchers"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        real_c = env.get("CC") or shutil.which("clang") or "/usr/bin/clang"
+        real_cxx = env.get("CXX") or shutil.which("clang++") or "/usr/bin/clang++"
+        for name, real in (("clang", real_c), ("clang++", real_cxx)):
+            script = shim_dir / name
+            script.write_text(
+                "#!/usr/bin/env bash\n"
+                f"exec abicheck-cc {shlex.quote(real)} \"$@\"\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o755)
+        env["_ABICHECK_PRE_LAUNCHER_PATH"] = env.get("PATH", "")
+        env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
+        config["compiler_launcher_dir"] = str(shim_dir)
+        config["real_compilers"] = {"clang": real_c, "clang++": real_cxx}
+    json_dump(output / "build_integration_config.json", config)
+    return pack
+
+
+def sanitize_compile_db(path: Path, output: Path) -> tuple[Path, dict[str, Any]]:
+    """Strip only the compiler-launcher token, preserving every real Clang flag."""
+    entries = load_compile_db(path)
+    compress_copy(path, output / "compile_commands.raw.json.gz")
+    changed = 0
+    for row in entries:
+        arguments = row.get("arguments")
+        if isinstance(arguments, list) and arguments:
+            tokens = [str(x) for x in arguments]
+            if Path(tokens[0]).name == "abicheck-cc":
+                tokens = tokens[1:]
+                changed += 1
+            if tokens and "compiler-launchers" in tokens[0]:
+                real = Path("/usr/bin") / Path(tokens[0]).name
+                if real.exists():
+                    tokens[0] = str(real)
+                    changed += 1
+            row["arguments"] = tokens
+        elif isinstance(row.get("command"), str):
+            command = str(row["command"])
+            try:
+                tokens = shlex.split(command)
+            except ValueError:
+                tokens = command.split()
+            if tokens and Path(tokens[0]).name == "abicheck-cc":
+                tokens = tokens[1:]
+                changed += 1
+            if tokens and "compiler-launchers" in tokens[0]:
+                real = Path("/usr/bin") / Path(tokens[0]).name
+                if real.exists():
+                    tokens[0] = str(real)
+                    changed += 1
+            row["command"] = shlex.join(tokens)
+    sanitized = path.with_name("compile_commands.abicheck.json")
+    sanitized.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    report = {
+        "raw_path": str(path),
+        "sanitized_path": str(sanitized),
+        "entries": len(entries),
+        "launcher_entries_stripped": changed,
+        "raw_sha256": sha256_file(path),
+        "sanitized_sha256": sha256_file(sanitized),
+    }
+    json_dump(output / "compile_db_sanitization.json", report)
+    return sanitized, report
+
+
+def archive_build_integration_pack(
+    pack: Path,
+    output: Path,
+    env: Mapping[str, str],
+    logs: Path,
+    timings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    manifest = pack / "manifest.json"
+    if not manifest.exists():
+        report = {
+            "status": "missing",
+            "pack": str(pack),
+            "reason": "manifest.json was not produced",
+        }
+        json_dump(output / "build_integration_pack_summary.json", report)
+        return report
+    try:
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        manifest_data = {"parse_error": str(exc)}
+    shutil.copy2(manifest, output / "build_integration_manifest.json")
+    tree = tree_manifest(pack, output / "build_integration_tree.jsonl.gz")
+    archive = output / "abicheck_inputs.tar.zst"
+    result = run_timed(
+        "archive-build-integration-pack",
+        [
+            "tar", "-I", "zstd -T0 -3", "-cf", str(archive),
+            "-C", str(pack.parent), pack.name,
+        ],
+        cwd=pack.parent,
+        env=env,
+        logs=logs,
+        timeout=3600,
+        allow_failure=True,
+    )
+    timings.append(command_record(result))
+    report = {
+        "status": "present" if archive.exists() else "archive-failed",
+        "pack": str(pack),
+        "manifest": manifest_data,
+        "tree": tree,
+        "archive": str(archive.relative_to(output)) if archive.exists() else None,
+        "archive_size_bytes": archive.stat().st_size if archive.exists() else None,
+        "archive_sha256": sha256_file(archive) if archive.exists() else None,
+        "archive_returncode": result.returncode,
+    }
+    json_dump(output / "build_integration_pack_summary.json", report)
+    return report
+
+
+def build_cmake(
+    target: Target,
+    src: Path,
+    build: Path,
+    install: Path,
+    env: dict[str, str],
+    logs: Path,
+    timings: list[dict[str, Any]],
+    jobs: int,
+) -> Path:
+    configure = [
