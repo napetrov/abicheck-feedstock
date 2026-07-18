@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        target: [onedal]
+        target: [onednn]
     steps:
       - name: Checkout orchestration branch
         uses: actions/checkout@v4
@@ -94,6 +94,21 @@ jobs:
           path.write_text(text.replace(old_dedupe, new_dedupe))
           PY
           echo "ae770f64a82bef5d8fb3a319151baf258ca686aa8ad16e58ecfbe79551dbdcc9  ci/abicheck_realworld_scan.py" | sha256sum -c -
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("ci/abicheck_realworld_scan.py")
+          text = path.read_text()
+          replacements = {
+              'full_cmd, cwd=src, check=False, timeout=1500': 'full_cmd, cwd=src, check=False, timeout=180 if target == "onednn" else 1500',
+              'clang_full_cmd, cwd=src, check=False, timeout=1500,': 'clang_full_cmd, cwd=src, check=False, timeout=180 if target == "onednn" else 1500,',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f"oneDNN timeout patch target count for {old!r}: {text.count(old)}")
+              text = text.replace(old, new)
+          path.write_text(text)
+          PY
+          sha256sum ci/abicheck_realworld_scan.py
           base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
           python -m py_compile ci/abicheck_realworld_scan.py ci/aggregate_abicheck.py
 
