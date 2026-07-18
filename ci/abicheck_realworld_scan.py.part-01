@@ -1,0 +1,223 @@
+    src = work_root / "src"
+    if src.exists():
+        shutil.rmtree(src)
+    runner.run(
+        "git_clone",
+        ["git", "clone", "--filter=blob:none", "--recurse-submodules", "--shallow-submodules",
+         "--depth", "1", "--branch", config["ref"], config["repo"], str(src)],
+        cwd=work_root,
+        check=True,
+        timeout=900,
+    )
+    # Some release tags have submodules whose shallow fetch is not accepted.
+    runner.run(
+        "git_submodule_sync",
+        ["git", "submodule", "sync", "--recursive"],
+        cwd=src,
+        check=False,
+        timeout=120,
+    )
+    runner.run(
+        "git_submodule_update",
+        ["git", "submodule", "update", "--init", "--recursive", "--depth", "1"],
+        cwd=src,
+        check=False,
+        timeout=900,
+    )
+    return src
+
+
+def cmake_build(
+    runner: Runner,
+    src: Path,
+    build: Path,
+    install: Path,
+    options: Sequence[str],
+) -> None:
+    build.mkdir(parents=True, exist_ok=True)
+    configure = [
+        "cmake", "-S", str(src), "-B", str(build), "-G", "Ninja",
+        "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        f"-DCMAKE_INSTALL_PREFIX={install}",
+        *options,
+    ]
+    runner.run("cmake_configure", configure, cwd=src, check=True, timeout=1200)
+    jobs = os.environ.get("ABICHECK_BUILD_JOBS", "2")
+    runner.run("cmake_build", ["cmake", "--build", str(build), "--parallel", jobs], cwd=src, check=True, timeout=10800)
+    runner.run("cmake_install", ["cmake", "--install", str(build)], cwd=src, check=False, timeout=1200)
+
+
+def build_target(
+    target: str,
+    runner: Runner,
+    src: Path,
+    work_root: Path,
+) -> tuple[Path, Path, Path, list[Path]]:
+    build = work_root / "build"
+    install = work_root / "install"
+    include_dirs: list[Path] = []
+    if target == "onetbb":
+        cmake_build(runner, src, build, install, [
+            "-DTBB_TEST=OFF", "-DTBB_EXAMPLES=OFF", "-DTBB_STRICT=OFF",
+            "-DTBB_ENABLE_IPO=OFF", "-DTBB_DISABLE_HWLOC_AUTOMATIC_SEARCH=OFF",
+        ])
+        header_root = install / "include"
+        if not header_root.exists():
+            header_root = src / "include"
+        include_dirs = [header_root, src / "include"]
+    elif target == "onednn":
+        cmake_build(runner, src, build, install, [
+            "-DONEDNN_LIBRARY_TYPE=SHARED", "-DONEDNN_CPU_RUNTIME=SEQ",
+            "-DONEDNN_GPU_RUNTIME=NONE", "-DONEDNN_BUILD_DOC=OFF",
+            "-DONEDNN_BUILD_EXAMPLES=OFF", "-DONEDNN_BUILD_TESTS=OFF",
+            "-DONEDNN_BUILD_GRAPH=ON", "-DONEDNN_ENABLE_JIT_PROFILING=OFF",
+            "-DONEDNN_ENABLE_ITT_TASKS=OFF",
+        ])
+        header_root = install / "include"
+        if not header_root.exists():
+            header_root = src / "include"
+        include_dirs = [header_root, src / "include", build / "include"]
+    elif target == "level-zero":
+        cmake_build(runner, src, build, install, [
+            "-DBUILD_TESTS=OFF", "-DBUILD_STATIC=OFF", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        ])
+        header_root = install / "include"
+        if not header_root.exists():
+            header_root = src / "include"
+        include_dirs = [header_root, src / "include", build / "include"]
+    elif target == "onedal":
+        build.mkdir(parents=True, exist_ok=True)
+        jobs = os.environ.get("ABICHECK_ONEDAL_JOBS", "2")
+        # oneDAL 2026.1.0's reference-backend Clang specialization appends
+        # flags with a recursively self-referential '=' assignment. GNU make
+        # rejects it before compilation. Convert only those two assignments to
+        # '+=' and preserve the exact source diff in the timing/log evidence.
+        clang_ref_mk = src / "dev/make/compiler_definitions/clang.ref.32e.mk"
+        clang_ref_text = clang_ref_mk.read_text()
+        clang_ref_fixed = clang_ref_text.replace(
+            "COMPILER.mac.clang = $(COMPILER.mac.clang) -DDAAL_REF -DONEDAL_REF",
+            "COMPILER.mac.clang += -DDAAL_REF -DONEDAL_REF",
+        ).replace(
+            "COMPILER.lnx.clang = $(COMPILER.lnx.clang) -DDAAL_REF -DONEDAL_REF",
+            "COMPILER.lnx.clang += -DDAAL_REF -DONEDAL_REF",
+        )
+        if clang_ref_fixed == clang_ref_text:
+            raise RuntimeError("Expected oneDAL Clang reference-backend assignments were not found")
+        clang_ref_mk.write_text(clang_ref_fixed)
+        runner.run(
+            "onedal_patch_clang_ref_makefile",
+            ["git", "diff", "--", str(clang_ref_mk.relative_to(src))],
+            cwd=src,
+            check=True,
+        )
+        # oneDAL's makefiles expect dependency prefixes with include/ and lib/
+        # directly below the root. Ubuntu uses multiarch library directories, so
+        # create deterministic shim prefixes rather than depending on linker magic.
+        deps = work_root / "system-deps"
+        openblas = deps / "openblas"
+        tbb = deps / "tbb"
+        for prefix in (openblas, tbb):
+            (prefix / "include").mkdir(parents=True, exist_ok=True)
+            (prefix / "lib").mkdir(parents=True, exist_ok=True)
+        multiarch = Path("/usr/lib/x86_64-linux-gnu")
+        openblas_include_candidates = [
+            Path("/usr/include/x86_64-linux-gnu/openblas-pthread"),
+            Path("/usr/include/openblas"), Path("/usr/include"),
+        ]
+        openblas_include = next((p for p in openblas_include_candidates if p.exists()), Path("/usr/include"))
+        shutil.rmtree(openblas / "include", ignore_errors=True)
+        os.symlink(openblas_include, openblas / "include", target_is_directory=True)
+        openblas_lib_candidates = [
+            multiarch / "libopenblas.a",
+            multiarch / "openblas-pthread" / "libopenblas.a",
+            Path("/usr/lib/libopenblas.a"),
+        ]
+        openblas_lib = next((p for p in openblas_lib_candidates if p.exists()), None)
+        if openblas_lib is None:
+            raise RuntimeError("libopenblas.a was not found after installing libopenblas-dev")
+        os.symlink(openblas_lib, openblas / "lib" / "libopenblas.a")
+        shutil.rmtree(tbb / "include", ignore_errors=True)
+        os.symlink(Path("/usr/include"), tbb / "include", target_is_directory=True)
+        for candidate in sorted(multiarch.glob("libtbb*.so*")):
+            dest = tbb / "lib" / candidate.name
+            if not dest.exists():
+                os.symlink(candidate, dest)
+        env = {
+            "CC": "clang",
+            "CXX": "clang++",
+            "OPENBLASROOT": str(openblas),
+            "TBBROOT": str(tbb),
+            "LD_LIBRARY_PATH": f"{tbb / 'lib'}:{multiarch}:/usr/lib",
+        }
+        cmd = [
+            "bear", "--output", str(build / "compile_commands.json"), "--",
+            "bash", ".ci/scripts/build.sh",
+            "--compiler", "clang", "--optimizations", "sse2",
+            "--target", "onedal_c", "--backend-config", "ref",
+            "--blas-dir", str(openblas), "--tbb-dir", str(tbb),
+            "--debug", "symbols", "--jobs", jobs,
+        ]
+        first = runner.run("onedal_build_bear_system_deps", cmd, cwd=src, env=env, check=False, timeout=14400)
+        if first.returncode != 0:
+            # Preserve the first failure, then use the repository's own TBB bootstrap.
+            runner.run("onedal_download_tbb", ["bash", "dev/download_tbb.sh"], cwd=src, env=env, check=False, timeout=1800)
+            cmd2 = [
+                "bear", "--append", "--output", str(build / "compile_commands.json"), "--",
+                "bash", ".ci/scripts/build.sh",
+                "--compiler", "clang", "--optimizations", "sse2",
+                "--target", "onedal_c", "--backend-config", "ref",
+                "--blas-dir", str(openblas), "--debug", "symbols", "--jobs", jobs,
+            ]
+            runner.run("onedal_build_bear_repo_tbb", cmd2, cwd=src, env=env, check=True, timeout=14400)
+        release_candidates = sorted(src.glob("__release_lnx*/daal/latest"))
+        if not release_candidates:
+            raise RuntimeError("oneDAL build completed but no __release_lnx*/daal/latest directory was found")
+        release = release_candidates[-1]
+        header_root = release / "include"
+        install = release
+        include_dirs = [header_root, src / "cpp", src / "cpp" / "daal" / "include", src / "cpp" / "oneapi" / "dal"]
+    else:
+        raise ValueError(f"Unknown target: {target}")
+    include_dirs = [p for p in include_dirs if p.exists()]
+    return build, install, header_root, include_dirs
+
+
+def iter_source_files(src: Path) -> Iterable[Path]:
+    for path in src.rglob("*"):
+        if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
+            continue
+        rel_parts = set(path.relative_to(src).parts)
+        if rel_parts & EXCLUDED_PARTS:
+            continue
+        yield path
+
+
+def line_count(path: Path) -> int:
+    try:
+        with path.open("rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return -1
+
+
+def collect_source_inventory(src: Path, header_root: Path, compile_db: Path, result_dir: Path) -> dict[str, Any]:
+    compile_files: set[str] = set()
+    compile_entries: list[dict[str, Any]] = []
+    if compile_db.exists():
+        try:
+            compile_entries = json.loads(compile_db.read_text(encoding="utf-8"))
+            for entry in compile_entries:
+                f = Path(entry.get("file", ""))
+                if not f.is_absolute():
+                    f = Path(entry.get("directory", src)) / f
+                try:
+                    compile_files.add(str(f.resolve()))
+                except OSError:
+                    compile_files.add(str(f))
+        except Exception:
+            compile_entries = []
+    rows: list[dict[str, Any]] = []
+    totals: dict[str, int] = {"files": 0, "lines": 0, "headers": 0, "sources": 0, "compiled_files": 0}
+    for path in sorted(iter_source_files(src)):
+        rel = path.relative_to(src)
