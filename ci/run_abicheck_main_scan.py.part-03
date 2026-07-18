@@ -1,0 +1,239 @@
+        "cmake", "-S", str(src), "-B", str(build), "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "-DCMAKE_C_COMPILER=clang",
+        "-DCMAKE_CXX_COMPILER=clang++",
+        "-DCMAKE_C_COMPILER_LAUNCHER=abicheck-cc",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=abicheck-cc",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        f"-DCMAKE_INSTALL_PREFIX={install}",
+        *target.cmake_args,
+    ]
+    result = run_timed(
+        "cmake-configure", configure, cwd=src, env=env, logs=logs, timeout=1800
+    )
+    timings.append(command_record(result))
+    result = run_timed(
+        "build",
+        ["cmake", "--build", str(build), "--parallel", str(jobs)],
+        cwd=src,
+        env=env,
+        logs=logs,
+        timeout=10800,
+    )
+    timings.append(command_record(result))
+    result = run_timed(
+        "install",
+        ["cmake", "--install", str(build)],
+        cwd=src,
+        env=env,
+        logs=logs,
+        timeout=1800,
+        allow_failure=True,
+    )
+    timings.append(command_record(result))
+    compile_db = build / "compile_commands.json"
+    if not compile_db.exists():
+        raise HarnessError(f"compile database was not generated: {compile_db}")
+    return compile_db
+
+
+def build_onedal(
+    target: Target,
+    src: Path,
+    work: Path,
+    build: Path,
+    install: Path,
+    env: dict[str, str],
+    logs: Path,
+    timings: list[dict[str, Any]],
+    jobs: int,
+    output: Path,
+) -> Path:
+    del target
+    apply_onedal_patch(src, output / "onedal-clang-ref.patch")
+    setup_onedal_dependencies(src, work / "deps", env, output / "onedal-dependencies.json")
+    compile_db = build / "compile_commands.json"
+    compile_db.parent.mkdir(parents=True, exist_ok=True)
+    workdir = build / "work"
+    releasedir = install
+    command = [
+        "bear", "--output", str(compile_db), "--",
+        "make", "-f", "makefile", "onedal_c",
+        f"-j{jobs}",
+        "PLAT=lnx32e",
+        "COMPILER=clang",
+        "BACKEND_CONFIG=ref",
+        "OPTFLAG=O2",
+        "LINKER=lld",
+        "REQDBG=symbols",
+        "REQCPU=sse2",
+        "STDALLOC=yes",
+        "BUILD_PARAMETERS_LIB=yes",
+        f"WORKDIR={workdir}",
+        f"RELEASEDIR={releasedir}",
+    ]
+    result = run_timed(
+        "build", command, cwd=src, env=env, logs=logs, timeout=14400
+    )
+    timings.append(command_record(result))
+    if not compile_db.exists():
+        raise HarnessError(f"bear did not produce {compile_db}")
+    return compile_db
+
+
+def load_compile_db(path: Path) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HarnessError(f"cannot read compile database {path}: {exc}") from exc
+    if not isinstance(value, list):
+        raise HarnessError("compile database root is not a list")
+    return [row for row in value if isinstance(row, dict)]
+
+
+def normalize_source_from_entry(row: Mapping[str, Any]) -> Path | None:
+    file_value = row.get("file")
+    if not isinstance(file_value, str):
+        return None
+    path = Path(file_value)
+    directory = row.get("directory")
+    if not path.is_absolute() and isinstance(directory, str):
+        path = Path(directory) / path
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def compress_copy(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("rb") as in_fh, gzip.open(dest, "wb", compresslevel=6) as out_fh:
+        shutil.copyfileobj(in_fh, out_fh)
+
+
+def compile_db_report(path: Path, output: Path) -> tuple[list[dict[str, Any]], set[Path]]:
+    entries = load_compile_db(path)
+    source_paths = {p for row in entries if (p := normalize_source_from_entry(row)) is not None}
+    compilers: dict[str, int] = {}
+    languages: dict[str, int] = {}
+    for row in entries:
+        command = row.get("arguments")
+        if isinstance(command, list) and command:
+            compiler = str(command[0])
+            tokens = [str(x) for x in command]
+        else:
+            command_text = str(row.get("command", ""))
+            try:
+                tokens = shlex.split(command_text)
+            except ValueError:
+                tokens = command_text.split()
+            compiler = tokens[0] if tokens else ""
+        compilers[compiler] = compilers.get(compiler, 0) + 1
+        source = normalize_source_from_entry(row)
+        suffix = source.suffix.lower() if source else ""
+        lang = "c++" if suffix in {".cc", ".cpp", ".cxx", ".c++", ".mm"} else "c"
+        languages[lang] = languages.get(lang, 0) + 1
+    report = {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "entries": len(entries),
+        "unique_sources": len(source_paths),
+        "compilers": compilers,
+        "languages": languages,
+    }
+    json_dump(output / "compile_db_summary.json", report)
+    compress_copy(path, output / "compile_commands.json.gz")
+    return entries, source_paths
+
+
+def count_lines(path: Path) -> int | None:
+    try:
+        with path.open("rb") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return None
+
+
+def inventory_source_tree(
+    src: Path,
+    compile_sources: set[Path],
+    output: Path,
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    total_bytes = 0
+    total_lines = 0
+    for path in sorted(src.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = path.relative_to(src)
+        if any(part in SKIP_DIR_NAMES for part in rel.parts):
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in SOURCE_SUFFIXES:
+            continue
+        try:
+            resolved = path.resolve()
+            size = path.stat().st_size
+            digest = sha256_file(path)
+        except OSError:
+            continue
+        kind = "header" if suffix in HEADER_SUFFIXES else "source"
+        lines = count_lines(path)
+        counts[kind] = counts.get(kind, 0) + 1
+        total_bytes += size
+        total_lines += lines or 0
+        rows.append(
+            {
+                "path": str(rel),
+                "kind": kind,
+                "suffix": suffix,
+                "size_bytes": size,
+                "lines": lines,
+                "sha256": digest,
+                "in_compile_db": resolved in compile_sources,
+            }
+        )
+    csv_path = output / "source_inventory.csv.gz"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(csv_path, "wt", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "path", "kind", "suffix", "size_bytes", "lines", "sha256",
+                "in_compile_db",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        "files": len(rows),
+        "by_kind": counts,
+        "total_bytes": total_bytes,
+        "total_lines": total_lines,
+        "compile_db_members": sum(1 for row in rows if row["in_compile_db"]),
+    }
+    json_dump(output / "source_inventory_summary.json", summary)
+    return summary
+
+
+def resolve_public_inputs(target: Target, src: Path) -> tuple[list[Path], list[Path]]:
+    header_dirs = [src / rel for rel in target.public_header_dirs if (src / rel).exists()]
+    if target.name == "level-zero":
+        headers = [
+            p for p in sorted((src / "include").glob("*.h"))
+            if p.is_file() and not p.name.endswith("_version.h")
+        ]
+    else:
+        headers = [src / rel for rel in target.public_headers if (src / rel).exists()]
+    if not headers:
+        raise HarnessError(f"no public umbrella headers resolved for {target.name}")
+    if not header_dirs:
+        raise HarnessError(f"no public header directories resolved for {target.name}")
+    return headers, header_dirs
+
+
+def inventory_public_headers(
+    src: Path,
+    header_dirs: Sequence[Path],
+    output: Path,
