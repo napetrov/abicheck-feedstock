@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Build and inventory a real-world C/C++ project, then run abicheck 0.3.0.
+
+This script is intentionally evidence-preserving: every command gets raw stdout,
+stderr, timing/resource data, and a machine-readable record. Full public-header
+scans are attempted first. If a project's aggregate header surface cannot be
+parsed as one translation unit, umbrella-header and DWARF fallbacks are retained
+alongside the failed full-scan logs.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import resource
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+TARGETS: dict[str, dict[str, Any]] = {
+    "onedal": {
+        "repo": "https://github.com/uxlfoundation/oneDAL.git",
+        "ref": "2026.1.0",
+        "version": "2026.1.0",
+        "language": "c++",
+        "header_parse_compiler": "clang++",
+        "header_parse_options": "-std=gnu++17 -Wno-error -Wno-unknown-warning-option",
+        "umbrellas": [
+            "oneapi/dal.hpp", "oneapi/dal/algo.hpp", "daal.h", "daal.hpp",
+        ],
+    },
+    "onetbb": {
+        "repo": "https://github.com/uxlfoundation/oneTBB.git",
+        "ref": "v2023.0.0",
+        "version": "2023.0.0",
+        "language": "c++",
+        "header_parse_compiler": "clang++",
+        "header_parse_options": "-std=gnu++17 -Wno-error -Wno-unknown-warning-option",
+        "umbrellas": [
+            "oneapi/tbb.h", "oneapi/tbb/tbb.h", "tbb/tbb.h",
+        ],
+    },
+    "onednn": {
+        "repo": "https://github.com/uxlfoundation/oneDNN.git",
+        "ref": "v3.12",
+        "version": "3.12",
+        "language": "c++",
+        "header_parse_compiler": "clang++",
+        "header_parse_options": "-std=gnu++17 -Wno-error -Wno-unknown-warning-option",
+        "umbrellas": [
+            "oneapi/dnnl/dnnl.hpp", "oneapi/dnnl/dnnl.h",
+            "oneapi/dnnl/dnnl_graph.hpp", "oneapi/dnnl/dnnl_graph.h",
+            "dnnl.hpp", "dnnl.h", "dnnl_graph.hpp", "dnnl_graph.h",
+        ],
+    },
+    "level-zero": {
+        "repo": "https://github.com/oneapi-src/level-zero.git",
+        "ref": "v1.32.0",
+        "version": "1.32.0",
+        "api_language": "c",
+        "language": "c++",
+        "header_parse_compiler": "clang++",
+        "header_parse_options": "-std=gnu++17 -Wno-error -Wno-unknown-warning-option",
+        "umbrellas": [
+            "ze_api.h", "zes_api.h", "zet_api.h", "zel_tracing_api.h",
+            "ze_ddi.h", "zes_ddi.h", "zet_ddi.h", "zel_tracing_ddi.h",
+        ],
+    },
+}
+
+HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx", ".ipp", ".tpp", ".inc"}
+SOURCE_SUFFIXES = HEADER_SUFFIXES | {".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".S", ".s"}
+EXCLUDED_PARTS = {
+    ".git", ".github", "build", "build-release", "install", "_deps",
+    "third_party", "third-party", "external", "extern", "vendor",
+}
+
+
+@dataclass
+class TimingRecord:
+    label: str
+    command: list[str]
+    cwd: str
+    started_at: str
+    finished_at: str
+    wall_seconds: float
+    user_seconds: float | None
+    system_seconds: float | None
+    max_rss_kb: int | None
+    exit_code: int
+    stdout_path: str
+    stderr_path: str
+
+
+class Runner:
+    def __init__(self, result_dir: Path) -> None:
+        self.result_dir = result_dir
+        self.logs_dir = result_dir / "logs"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.records: list[TimingRecord] = []
+        self._counter = 0
+
+    @staticmethod
+    def _now() -> str:
+        return dt.datetime.now(dt.timezone.utc).isoformat()
+
+    def run(
+        self,
+        label: str,
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        check: bool = False,
+        timeout: int | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        self._counter += 1
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_")[:96]
+        stem = f"{self._counter:03d}_{safe}"
+        stdout_path = self.logs_dir / f"{stem}.stdout.log"
+        stderr_path = self.logs_dir / f"{stem}.stderr.log"
+        time_path = self.logs_dir / f"{stem}.gnu-time.txt"
+        cmd = [str(x) for x in command]
+        timed = [
+            "/usr/bin/time", "-v", "-o", str(time_path), "--",
+            *cmd,
+        ]
+        full_env = os.environ.copy()
+        if env:
+            full_env.update({str(k): str(v) for k, v in env.items()})
+        started = self._now()
+        t0 = time.monotonic()
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        timed_out = False
+        try:
+            with stdout_path.open("w", encoding="utf-8", errors="replace") as out, \
+                 stderr_path.open("w", encoding="utf-8", errors="replace") as err:
+                proc = subprocess.run(
+                    timed,
+                    cwd=str(cwd),
+                    env=full_env,
+                    stdout=out,
+                    stderr=err,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            with stderr_path.open("a", encoding="utf-8") as err:
+                err.write(f"\nSCRIPT TIMEOUT after {timeout}s: {exc}\n")
+            proc = subprocess.CompletedProcess(timed, 124, "", "")
+        finished = self._now()
+        wall = time.monotonic() - t0
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        parsed = parse_gnu_time(time_path)
+        record = TimingRecord(
+            label=label,
+            command=cmd,
+            cwd=str(cwd),
+            started_at=started,
+            finished_at=finished,
+            wall_seconds=round(wall, 6),
+            user_seconds=parsed.get("user_seconds", round(after.ru_utime - before.ru_utime, 6)),
+            system_seconds=parsed.get("system_seconds", round(after.ru_stime - before.ru_stime, 6)),
+            max_rss_kb=parsed.get("max_rss_kb"),
+            exit_code=124 if timed_out else int(proc.returncode),
+            stdout_path=str(stdout_path.relative_to(self.result_dir)),
+            stderr_path=str(stderr_path.relative_to(self.result_dir)),
+        )
+        self.records.append(record)
+        self.flush_timings()
+        if check and record.exit_code != 0:
+            raise subprocess.CalledProcessError(record.exit_code, cmd)
+        return subprocess.CompletedProcess(cmd, record.exit_code, "", "")
+
+    def flush_timings(self) -> None:
+        json_path = self.result_dir / "timings.json"
+        json_path.write_text(
+            json.dumps([asdict(x) for x in self.records], indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        csv_path = self.result_dir / "timings.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(asdict(self.records[0]).keys()) if self.records else ["label"])
+            writer.writeheader()
+            for item in self.records:
+                row = asdict(item)
+                row["command"] = shlex.join(row["command"])
+                writer.writerow(row)
+
+
+def parse_gnu_time(path: Path) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if not path.exists():
+        return out
+    text = path.read_text(encoding="utf-8", errors="replace")
+    patterns = {
+        "user_seconds": r"User time \(seconds\):\s*([0-9.]+)",
+        "system_seconds": r"System time \(seconds\):\s*([0-9.]+)",
+        "max_rss_kb": r"Maximum resident set size \(kbytes\):\s*(\d+)",
+    }
+    for key, pattern in patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            out[key] = int(m.group(1)) if key == "max_rss_kb" else float(m.group(1))
+    return out
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def command_output(command: Sequence[str], cwd: Path | None = None) -> str:
+    try:
+        return subprocess.check_output(
+            [str(x) for x in command], cwd=str(cwd) if cwd else None,
+            stderr=subprocess.STDOUT, text=True, timeout=30,
+        ).strip()
+    except Exception as exc:  # evidence collection must remain best effort
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+
+def write_environment(result_dir: Path) -> None:
+    commands = {
+        "date_utc": ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
+        "uname": ["uname", "-a"],
+        "os_release": ["bash", "-lc", "cat /etc/os-release"],
+        "cpu": ["bash", "-lc", "lscpu"],
+        "memory": ["bash", "-lc", "free -h"],
+        "disk": ["bash", "-lc", "df -h"],
+        "clang": ["clang", "--version"],
+        "clangxx": ["clang++", "--version"],
+        "cmake": ["cmake", "--version"],
+        "ninja": ["ninja", "--version"],
+        "bear": ["bear", "--version"],
+        "castxml": ["castxml", "--version"],
+        "abicheck": ["abicheck", "--version"],
+        "python": [sys.executable, "--version"],
+        "pip_freeze": [sys.executable, "-m", "pip", "freeze"],
+    }
+    payload = {
+        "python_platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "github": {k: v for k, v in os.environ.items() if k.startswith("GITHUB_") or k.startswith("RUNNER_")},
+        "tools": {name: command_output(cmd) for name, cmd in commands.items()},
+    }
+    (result_dir / "environment.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    with (result_dir / "environment.txt").open("w", encoding="utf-8") as f:
+        for name, value in payload["tools"].items():
+            f.write(f"===== {name} =====\n{value}\n\n")
+
+
+def clone_repo(runner: Runner, config: dict[str, Any], work_root: Path) -> Path:
