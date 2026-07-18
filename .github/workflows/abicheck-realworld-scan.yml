@@ -1,0 +1,109 @@
+name: abicheck real-world Clang scans
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/abicheck-realworld-scan.yml"
+      - "ci/abicheck_realworld_scan.py.gz.b64"
+      - "ci/aggregate_abicheck.py.gz.b64"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ABICHECK_BUILD_JOBS: "2"
+  ABICHECK_ONEDAL_JOBS: "2"
+
+jobs:
+  scan:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target: [onedal, onetbb, onednn, level-zero]
+    steps:
+      - name: Checkout orchestration branch
+        uses: actions/checkout@v4
+
+      - name: Expand orchestration scripts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d ci/abicheck_realworld_scan.py.gz.b64 | gzip -dc > ci/abicheck_realworld_scan.py
+          base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
+          python -m py_compile ci/abicheck_realworld_scan.py ci/aggregate_abicheck.py
+
+      - name: Install Clang, build, ABI, and dependency tooling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang lld cmake ninja-build bear binutils file jq zstd gzip \
+            libtbb-dev libhwloc-dev libopenblas-dev libspdlog-dev pkg-config \
+            patchelf python3-dev python3-pip
+          if ! sudo apt-get install -y castxml; then
+            python -m pip install --upgrade castxml
+          fi
+          python -m pip install --upgrade pip
+          python -m pip install "abicheck==0.3.0"
+          clang --version
+          castxml --version
+          abicheck --version
+
+      - name: Build with Clang and run full abicheck source scan
+        id: scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python ci/abicheck_realworld_scan.py \
+            --target "${{ matrix.target }}" \
+            --output-root "$GITHUB_WORKSPACE/abicheck-results"
+
+      - name: Upload complete target evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abicheck-${{ matrix.target }}
+          path: abicheck-results/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+  aggregate:
+    name: aggregate
+    if: always()
+    needs: scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout orchestration branch
+        uses: actions/checkout@v4
+      - name: Expand aggregation script
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
+          python -m py_compile ci/aggregate_abicheck.py
+      - name: Download target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: abicheck-*
+          path: downloaded
+      - name: Build combined report and evidence bundle
+        run: |
+          python ci/aggregate_abicheck.py --input downloaded --output combined
+          find combined -type f -print | sort > combined/file_manifest.txt
+          sha256sum $(find combined -type f -print | sort) > combined/SHA256SUMS
+      - name: Upload combined evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: abicheck-realworld-combined
+          path: combined
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
