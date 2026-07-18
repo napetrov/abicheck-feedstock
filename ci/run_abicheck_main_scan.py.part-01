@@ -1,0 +1,231 @@
+    return out
+
+
+def run_timed(
+    name: str,
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    logs: Path,
+    timeout: int,
+    allow_failure: bool = False,
+) -> CommandResult:
+    logs.mkdir(parents=True, exist_ok=True)
+    slug = safe_slug(name)
+    stdout_path = logs / f"{slug}.stdout.log"
+    stderr_path = logs / f"{slug}.stderr.log"
+    time_path = logs / f"{slug}.time.txt"
+    command_path = logs / f"{slug}.command.txt"
+    command = [str(x) for x in argv]
+    write_text(
+        command_path,
+        f"cwd={cwd}\nstarted={utc_now()}\ncommand={shlex.join(command)}\n",
+    )
+    started_at = utc_now()
+    t0 = time.monotonic()
+    timed_out = False
+    with stdout_path.open("w", encoding="utf-8", errors="replace") as out_fh, \
+         stderr_path.open("w", encoding="utf-8", errors="replace") as err_fh:
+        full = ["/usr/bin/time", "-v", "-o", str(time_path), "--", *command]
+        proc = subprocess.Popen(
+            full,
+            cwd=str(cwd),
+            env=dict(env),
+            stdout=out_fh,
+            stderr=err_fh,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                rc = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                rc = proc.wait(timeout=30)
+    wall = time.monotonic() - t0
+    finished_at = utc_now()
+    result = CommandResult(
+        name=name,
+        command=command,
+        cwd=str(cwd),
+        started_at=started_at,
+        finished_at=finished_at,
+        returncode=rc,
+        timed_out=timed_out,
+        wall_seconds=round(wall, 6),
+        stdout=str(stdout_path.relative_to(logs.parent)),
+        stderr=str(stderr_path.relative_to(logs.parent)),
+        time_file=str(time_path.relative_to(logs.parent)),
+        time_metrics=parse_gnu_time(time_path),
+    )
+    with command_path.open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"finished={finished_at}\nreturncode={rc}\ntimed_out={timed_out}\n"
+            f"measured_wall_seconds={wall:.6f}\n"
+        )
+    if (rc != 0 or timed_out) and not allow_failure:
+        raise HarnessError(
+            f"{name} failed (exit={rc}, timed_out={timed_out}); "
+            f"see {stderr_path}"
+        )
+    return result
+
+
+def command_record(result: CommandResult) -> dict[str, Any]:
+    return {
+        "name": result.name,
+        "command": result.command,
+        "cwd": result.cwd,
+        "started_at": result.started_at,
+        "finished_at": result.finished_at,
+        "returncode": result.returncode,
+        "timed_out": result.timed_out,
+        "wall_seconds": result.wall_seconds,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "time_file": result.time_file,
+        "time_metrics": result.time_metrics,
+    }
+
+
+def tool_version(argv: Sequence[str], timeout: int = 30) -> dict[str, Any]:
+    try:
+        proc = run_capture(argv, timeout=timeout)
+        text = (proc.stdout + proc.stderr).strip()
+        return {
+            "command": list(argv),
+            "returncode": proc.returncode,
+            "output": text,
+        }
+    except Exception as exc:
+        return {"command": list(argv), "error": str(exc)}
+
+
+def machine_environment(abicheck_sha: str) -> dict[str, Any]:
+    paths = [
+        "git", "python", "clang", "clang++", "cmake", "ninja", "make",
+        "bear", "abicheck", "readelf", "nm", "ldd", "file",
+    ]
+    tools: dict[str, Any] = {}
+    for name in paths:
+        resolved = shutil.which(name)
+        tools[name] = {
+            "path": resolved,
+            "version": tool_version(
+                [resolved, "--version"] if resolved else [name, "--version"]
+            ) if resolved else {"error": "not found"},
+        }
+    cpuinfo = Path("/proc/cpuinfo").read_text(errors="replace") if Path("/proc/cpuinfo").exists() else ""
+    meminfo = Path("/proc/meminfo").read_text(errors="replace") if Path("/proc/meminfo").exists() else ""
+    cgroup: dict[str, str] = {}
+    for candidate in (
+        Path("/sys/fs/cgroup/memory.max"),
+        Path("/sys/fs/cgroup/memory.current"),
+        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        if candidate.exists():
+            cgroup[str(candidate)] = candidate.read_text(errors="replace").strip()
+    return {
+        "captured_at": utc_now(),
+        "abicheck_main_sha": abicheck_sha,
+        "platform": platform.platform(),
+        "uname": list(platform.uname()),
+        "python": sys.version,
+        "cpu_count": os.cpu_count(),
+        "cpuinfo": cpuinfo,
+        "meminfo": meminfo,
+        "cgroup_memory": cgroup,
+        "environment": {
+            key: (
+                "<redacted>"
+                if any(marker in key.upper() for marker in (
+                    "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL",
+                    "PRIVATE_KEY", "AUTH",
+                ))
+                else value
+            )
+            for key, value in sorted(os.environ.items())
+        },
+        "tools": tools,
+    }
+
+
+def clone_target(
+    target: Target,
+    src: Path,
+    env: Mapping[str, str],
+    logs: Path,
+    timings: list[dict[str, Any]],
+) -> None:
+    result = run_timed(
+        "clone",
+        [
+            "git", "clone", "--depth", "1", "--branch", target.ref,
+            "--recurse-submodules", "--shallow-submodules", target.repo, str(src),
+        ],
+        cwd=src.parent,
+        env=env,
+        logs=logs,
+        timeout=1800,
+    )
+    timings.append(command_record(result))
+    # Some repositories declare submodules only conditionally; make the state explicit.
+    result = run_timed(
+        "submodules",
+        ["git", "submodule", "update", "--init", "--recursive", "--depth", "1"],
+        cwd=src,
+        env=env,
+        logs=logs,
+        timeout=1800,
+        allow_failure=True,
+    )
+    timings.append(command_record(result))
+
+
+def apply_onedal_patch(src: Path, output: Path) -> None:
+    path = src / "dev/make/compiler_definitions/clang.ref.32e.mk"
+    before = path.read_text(encoding="utf-8")
+    after = before.replace(
+        "COMPILER.mac.clang = $(COMPILER.mac.clang) -DDAAL_REF -DONEDAL_REF",
+        "COMPILER.mac.clang += -DDAAL_REF -DONEDAL_REF",
+    ).replace(
+        "COMPILER.lnx.clang = $(COMPILER.lnx.clang) -DDAAL_REF -DONEDAL_REF",
+        "COMPILER.lnx.clang += -DDAAL_REF -DONEDAL_REF",
+    )
+    if before == after:
+        raise HarnessError("oneDAL Clang/reference makefile patch target was not found")
+    path.write_text(after, encoding="utf-8")
+    diff = run_capture(["git", "diff", "--", str(path.relative_to(src))], cwd=src)
+    write_text(output, diff.stdout + diff.stderr)
+
+
+def first_existing(candidates: Iterable[Path]) -> Path | None:
+    return next((p for p in candidates if p.exists()), None)
+
+
+def setup_onedal_dependencies(src: Path, dep_root: Path, env: dict[str, str], output: Path) -> None:
+    multiarch_proc = run_capture(["dpkg-architecture", "-qDEB_HOST_MULTIARCH"])
+    if multiarch_proc.returncode != 0:
+        raise HarnessError(f"dpkg-architecture failed: {multiarch_proc.stderr}")
+    multiarch = multiarch_proc.stdout.strip()
+    tbb = dep_root / "tbb"
+    openblas = dep_root / "openblas"
+    (tbb / "include").mkdir(parents=True, exist_ok=True)
+    (tbb / "lib").mkdir(parents=True, exist_ok=True)
+    (openblas / "include").mkdir(parents=True, exist_ok=True)
+    (openblas / "lib").mkdir(parents=True, exist_ok=True)
+
+    for name in ("oneapi", "tbb"):
+        source = Path("/usr/include") / name
