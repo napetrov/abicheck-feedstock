@@ -1,0 +1,241 @@
+        kind = "header" if path.suffix in HEADER_SUFFIXES else "source"
+        lines = line_count(path)
+        compiled = str(path.resolve()) in compile_files
+        rows.append({
+            "path": str(rel), "suffix": path.suffix, "kind": kind,
+            "bytes": path.stat().st_size, "lines": lines, "in_compile_db": compiled,
+            "sha256": sha256_file(path),
+        })
+        totals["files"] += 1
+        totals["lines"] += max(lines, 0)
+        totals["headers" if kind == "header" else "sources"] += 1
+        totals["compiled_files"] += int(compiled)
+    with gzip.open(result_dir / "source_inventory.csv.gz", "wt", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["path", "suffix", "kind", "bytes", "lines", "in_compile_db", "sha256"])
+        writer.writeheader()
+        writer.writerows(rows)
+    public_headers = sorted(
+        p for p in header_root.rglob("*") if p.is_file() and p.suffix.lower() in HEADER_SUFFIXES
+    ) if header_root.exists() else []
+    with (result_dir / "public_headers.txt").open("w", encoding="utf-8") as f:
+        for p in public_headers:
+            f.write(str(p.relative_to(header_root)) + "\n")
+    db_stats = analyze_compile_db(compile_entries)
+    metrics = {
+        **totals,
+        "public_header_count": len(public_headers),
+        "public_header_bytes": sum(p.stat().st_size for p in public_headers),
+        "compile_db": db_stats,
+    }
+    (result_dir / "source_metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+    if compile_db.exists():
+        with compile_db.open("rb") as src_f, gzip.open(result_dir / "compile_commands.json.gz", "wb", compresslevel=9) as dst_f:
+            shutil.copyfileobj(src_f, dst_f)
+    return metrics
+
+
+def analyze_compile_db(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    compilers: dict[str, int] = {}
+    standards: dict[str, int] = {}
+    includes: set[str] = set()
+    defines: set[str] = set()
+    files: set[str] = set()
+    for entry in entries:
+        args = entry.get("arguments")
+        if not args:
+            args = shlex.split(entry.get("command", ""))
+        if not args:
+            continue
+        compilers[Path(args[0]).name] = compilers.get(Path(args[0]).name, 0) + 1
+        files.add(str(entry.get("file", "")))
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg.startswith("-std="):
+                standards[arg] = standards.get(arg, 0) + 1
+            elif arg in {"-I", "-isystem"} and i + 1 < len(args):
+                includes.add(args[i + 1]); i += 1
+            elif arg.startswith("-I") and len(arg) > 2:
+                includes.add(arg[2:])
+            elif arg.startswith("-D"):
+                defines.add(arg)
+            i += 1
+    return {
+        "entry_count": len(entries), "unique_files": len(files),
+        "compilers": dict(sorted(compilers.items())),
+        "standards": dict(sorted(standards.items())),
+        "unique_include_paths": len(includes), "unique_defines": len(defines),
+        "include_paths": sorted(includes), "defines": sorted(defines),
+    }
+
+
+def is_elf(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def discover_libraries(target: str, src: Path, build: Path, install: Path) -> list[Path]:
+    roots = [install, build, src]
+    candidates: list[Path] = []
+    prefixes = {
+        "onedal": ("libonedal", "libdaal"),
+        "onetbb": ("libtbb",),
+        "onednn": ("libdnnl",),
+        "level-zero": ("libze_",),
+    }.get(target, ("lib",))
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.so*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if not path.name.startswith(prefixes):
+                continue
+            if any(part.lower() in {"test", "tests", "example", "examples", "bench", "benchmarks"} for part in path.parts):
+                continue
+            if is_elf(path):
+                candidates.append(path)
+    seen: set[tuple[int, int]] = set()
+    out: list[Path] = []
+    for path in sorted(candidates, key=lambda p: (p.name, str(p))):
+        st = path.stat()
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def readelf_value(path: Path, regex: str, args: Sequence[str]) -> str | None:
+    text = command_output(["readelf", *args, str(path)])
+    m = re.search(regex, text)
+    return m.group(1).strip() if m else None
+
+
+def count_symbols(path: Path, defined_only: bool = False) -> int:
+    cmd = ["nm", "-D", "--format=posix"]
+    if defined_only:
+        cmd.append("--defined-only")
+    cmd.append(str(path))
+    text = command_output(cmd)
+    if text.startswith("ERROR:"):
+        return -1
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
+def collect_libraries(libraries: list[Path], result_dir: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for lib in libraries:
+        rows.append({
+            "name": lib.name,
+            "path": str(lib),
+            "bytes": lib.stat().st_size,
+            "sha256": sha256_file(lib),
+            "soname": readelf_value(lib, r"\(SONAME\).*\[(.*?)\]", ["-dW"]),
+            "build_id": readelf_value(lib, r"Build ID:\s*(\S+)", ["-nW"]),
+            "dynamic_symbols": count_symbols(lib, False),
+            "defined_dynamic_symbols": count_symbols(lib, True),
+            "has_dwarf": ".debug_info" in command_output(["readelf", "-SW", str(lib)]),
+            "needed": re.findall(r"\(NEEDED\).*\[(.*?)\]", command_output(["readelf", "-dW", str(lib)])),
+        })
+    with (result_dir / "libraries.json").open("w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, sort_keys=True)
+    with (result_dir / "libraries.csv").open("w", newline="", encoding="utf-8") as f:
+        fields = ["name", "path", "bytes", "sha256", "soname", "build_id", "dynamic_symbols", "defined_dynamic_symbols", "has_dwarf", "needed"]
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            r = dict(row); r["needed"] = ";".join(row["needed"])
+            writer.writerow(r)
+    return rows
+
+
+def find_umbrella_headers(header_root: Path, names: Sequence[str]) -> list[Path]:
+    out: list[Path] = []
+    for name in names:
+        p = header_root / name
+        if p.is_file():
+            out.append(p)
+    # Accommodate packages that install under include/<component>/ or preserve wrappers.
+    wanted = {Path(n).name for n in names}
+    if header_root.exists():
+        for p in header_root.rglob("*"):
+            if p.is_file() and p.name in wanted and p not in out:
+                out.append(p)
+    return sorted(out)
+
+
+def snapshot_stats(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"parse_error": f"{type(exc).__name__}: {exc}"}
+    stats: dict[str, Any] = {
+        "library": data.get("library"), "version": data.get("version"),
+        "schema_version": data.get("schema_version"), "platform": data.get("platform"),
+        "from_headers": data.get("from_headers"), "elf_only_mode": data.get("elf_only_mode"),
+        "language_profile": data.get("language_profile"), "scope_fallback": data.get("scope_fallback"),
+        "functions": len(data.get("functions") or []), "variables": len(data.get("variables") or []),
+        "types": len(data.get("types") or []), "enums": len(data.get("enums") or []),
+        "typedefs": len(data.get("typedefs") or []), "constants": len(data.get("constants") or []),
+    }
+    elf = data.get("elf") or {}
+    dwarf = data.get("dwarf") or {}
+    stats.update({
+        "elf_symbols": len(elf.get("symbols") or []), "elf_imports": len(elf.get("imports") or []),
+        "elf_needed": len(elf.get("needed") or []), "dwarf_has_dwarf": dwarf.get("has_dwarf"),
+        "dwarf_structs": len(dwarf.get("structs") or []), "dwarf_enums": len(dwarf.get("enums") or []),
+    })
+    return stats
+
+
+def run_abicheck_scans(
+    target: str,
+    config: dict[str, Any],
+    runner: Runner,
+    src: Path,
+    build: Path,
+    install: Path,
+    header_root: Path,
+    include_dirs: list[Path],
+    libraries: list[Path],
+    result_dir: Path,
+) -> list[dict[str, Any]]:
+    scans_dir = result_dir / "scans"
+    scans_dir.mkdir(parents=True, exist_ok=True)
+    compile_db = build / "compile_commands.json"
+    umbrellas = find_umbrella_headers(header_root, config["umbrellas"])
+    (result_dir / "umbrella_headers.txt").write_text(
+        "".join(str(x.relative_to(header_root)) + "\n" for x in umbrellas), encoding="utf-8"
+    )
+    records: list[dict[str, Any]] = []
+    lib_search_dirs = sorted({p.parent for p in libraries})
+    for index, lib in enumerate(libraries, 1):
+        lib_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{index:02d}_{lib.name}")
+        unit_dir = scans_dir / lib_id
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        data_sources_stdout = unit_dir / "data_sources.txt"
+        proc = runner.run(
+            f"data_sources_{lib_id}",
+            ["abicheck", "dump", str(lib), "--show-data-sources"],
+            cwd=src,
+            check=False,
+            timeout=300,
+        )
+        # Copy the command stdout into the scan unit for locality.
+        rec = runner.records[-1]
+        shutil.copy2(result_dir / rec.stdout_path, data_sources_stdout)
+        base = [
+            "abicheck", "dump", str(lib),
+            "--version", config["version"], "--git-tag", config["ref"],
+            "--build-id", os.environ.get("GITHUB_RUN_ID", "local"),
+            "--public-header-dir", str(header_root),
+            "-p", str(compile_db), "-v",
+        ]
+        if config["language"] == "c":
+            base += ["--lang", "c"]
+        for inc in include_dirs:
