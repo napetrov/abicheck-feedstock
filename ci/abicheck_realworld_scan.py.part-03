@@ -1,0 +1,201 @@
+            base += ["-I", str(inc)]
+        for libdir in lib_search_dirs:
+            base += ["--search-path", str(libdir)]
+        base += ["--follow-deps"]
+
+        attempts: list[dict[str, Any]] = []
+        # Attempt 1: exact Clang compile-database context across every installed
+        # public header. This is the primary, unmodified build-integration result.
+        full_snapshot = unit_dir / "snapshot.full-headers.exact.json"
+        full_cmd = [*base, "-H", str(header_root), "-o", str(full_snapshot)]
+        full = runner.run(
+            f"abicheck_full_headers_exact_{lib_id}", full_cmd, cwd=src, check=False, timeout=1500
+        )
+        attempts.append({
+            "mode": "full-public-header-directory-exact-build-context",
+            "exit_code": full.returncode,
+            "snapshot": str(full_snapshot.relative_to(result_dir)) if full_snapshot.exists() else None,
+            "stats": snapshot_stats(full_snapshot) if full_snapshot.exists() else None,
+            "compiler_override": None,
+            "gcc_options_override": None,
+        })
+        selected = full_snapshot if full.returncode == 0 and full_snapshot.exists() else None
+
+        # Attempt 2: retain the compile database but explicitly resolve CastXML's
+        # compiler environment through the same Clang family used for the build.
+        # A modern language floor is appended after compile-db flags so CastXML
+        # 0.6.x can parse current libstdc++ headers even when a project itself was
+        # built in C++11 mode. The exact attempt above is always preserved.
+        parse_compiler = shutil.which(config["header_parse_compiler"]) or config["header_parse_compiler"]
+        parse_options = config["header_parse_options"]
+        if selected is None:
+            clang_full_snapshot = unit_dir / "snapshot.full-headers.clang-integrated.json"
+            clang_full_cmd = [
+                *base,
+                "--gcc-path", parse_compiler,
+                "--gcc-options", parse_options,
+                "-H", str(header_root),
+                "-o", str(clang_full_snapshot),
+            ]
+            clang_full = runner.run(
+                f"abicheck_full_headers_clang_integrated_{lib_id}",
+                clang_full_cmd, cwd=src, check=False, timeout=1500,
+            )
+            attempts.append({
+                "mode": "full-public-header-directory-clang-integrated",
+                "exit_code": clang_full.returncode,
+                "snapshot": str(clang_full_snapshot.relative_to(result_dir)) if clang_full_snapshot.exists() else None,
+                "stats": snapshot_stats(clang_full_snapshot) if clang_full_snapshot.exists() else None,
+                "compiler_override": parse_compiler,
+                "gcc_options_override": parse_options,
+            })
+            if clang_full.returncode == 0 and clang_full_snapshot.exists():
+                selected = clang_full_snapshot
+
+        # Attempt 3: canonical umbrella surface. A generated .hpp wrapper is
+        # intentional for C++ libraries: abicheck 0.3.0 auto-detects language
+        # from the concrete header extension after CLI normalization, while a
+        # forwarding-only .h umbrella contains no detectable C++ syntax.
+        if selected is None and umbrellas:
+            wrapper_suffix = ".hpp" if config["language"] == "c++" else ".h"
+            umbrella_wrapper = unit_dir / f"public_umbrella{wrapper_suffix}"
+            umbrella_wrapper.write_text(
+                "".join(f'#include "{h.resolve()}"\n' for h in umbrellas),
+                encoding="utf-8",
+            )
+            umbrella_snapshot = unit_dir / "snapshot.umbrella-headers.clang-integrated.json"
+            umbrella_cmd = [
+                *base,
+                "--gcc-path", parse_compiler,
+                "--gcc-options", parse_options,
+                "-H", str(umbrella_wrapper),
+                "-o", str(umbrella_snapshot),
+            ]
+            umb = runner.run(
+                f"abicheck_umbrella_headers_clang_integrated_{lib_id}",
+                umbrella_cmd, cwd=src, check=False, timeout=1500,
+            )
+            attempts.append({
+                "mode": "umbrella-headers-clang-integrated",
+                "exit_code": umb.returncode,
+                "snapshot": str(umbrella_snapshot.relative_to(result_dir)) if umbrella_snapshot.exists() else None,
+                "stats": snapshot_stats(umbrella_snapshot) if umbrella_snapshot.exists() else None,
+                "umbrella_wrapper": str(umbrella_wrapper.relative_to(result_dir)),
+                "compiler_override": parse_compiler,
+                "gcc_options_override": parse_options,
+            })
+            if umb.returncode == 0 and umbrella_snapshot.exists():
+                selected = umbrella_snapshot
+
+        # Attempt 4: binary + DWARF evidence if header AST modes fail.
+        if selected is None:
+            dwarf_snapshot = unit_dir / "snapshot.dwarf-only.json"
+            dwarf_cmd = [
+                "abicheck", "dump", str(lib), "--dwarf-only",
+                "--version", config["version"], "--git-tag", config["ref"],
+                "--build-id", os.environ.get("GITHUB_RUN_ID", "local"),
+                "--follow-deps", "-o", str(dwarf_snapshot), "-v",
+            ]
+            for libdir in lib_search_dirs:
+                dwarf_cmd += ["--search-path", str(libdir)]
+            dw = runner.run(
+                f"abicheck_dwarf_only_{lib_id}", dwarf_cmd, cwd=src, check=False, timeout=1200
+            )
+            attempts.append({
+                "mode": "dwarf-only", "exit_code": dw.returncode,
+                "snapshot": str(dwarf_snapshot.relative_to(result_dir)) if dwarf_snapshot.exists() else None,
+                "stats": snapshot_stats(dwarf_snapshot) if dwarf_snapshot.exists() else None,
+            })
+            if dw.returncode == 0 and dwarf_snapshot.exists():
+                selected = dwarf_snapshot
+
+        if selected is not None:
+            selected_link = unit_dir / "snapshot.selected.json"
+            shutil.copy2(selected, selected_link)
+        record = {
+            "library": str(lib), "library_name": lib.name,
+            "data_sources_exit_code": proc.returncode,
+            "attempts": attempts,
+            "selected_snapshot": str((unit_dir / "snapshot.selected.json").relative_to(result_dir)) if selected else None,
+            "selected_stats": snapshot_stats(unit_dir / "snapshot.selected.json") if selected else None,
+        }
+        (unit_dir / "scan_record.json").write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+        records.append(record)
+    (result_dir / "scan_records.json").write_text(json.dumps(records, indent=2, sort_keys=True), encoding="utf-8")
+    return records
+
+
+def preserve_build_metadata(target: str, src: Path, build: Path, install: Path, result_dir: Path) -> None:
+    meta_dir = result_dir / "build_metadata"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        build / "CMakeCache.txt", build / "build.ninja", build / ".ninja_log",
+        src / "makefile", src / "CMakeLists.txt",
+    ]
+    for p in candidates:
+        if p.is_file():
+            dest = meta_dir / p.name
+            if p.stat().st_size > 2_000_000:
+                with p.open("rb") as src_f, gzip.open(dest.with_suffix(dest.suffix + ".gz"), "wb", compresslevel=9) as dst_f:
+                    shutil.copyfileobj(src_f, dst_f)
+            else:
+                shutil.copy2(p, dest)
+    # File trees are data without copying gigabytes of binaries/source.
+    for name, root in [("build_tree", build), ("install_tree", install)]:
+        with gzip.open(meta_dir / f"{name}.txt.gz", "wt", encoding="utf-8") as f:
+            if root.exists():
+                for p in sorted(root.rglob("*")):
+                    try:
+                        rel = p.relative_to(root)
+                        if p.is_file():
+                            f.write(f"F\t{p.stat().st_size}\t{rel}\n")
+                        elif p.is_dir():
+                            f.write(f"D\t0\t{rel}\n")
+                        elif p.is_symlink():
+                            f.write(f"L\t0\t{rel}\t{os.readlink(p)}\n")
+                    except OSError as exc:
+                        f.write(f"E\t0\t{p}\t{exc}\n")
+
+
+def build_summary(
+    target: str,
+    config: dict[str, Any],
+    src: Path,
+    result_dir: Path,
+    source_metrics: dict[str, Any] | None,
+    libraries: list[dict[str, Any]],
+    scans: list[dict[str, Any]],
+    runner: Runner,
+    fatal_error: str | None,
+) -> dict[str, Any]:
+    commit = command_output(["git", "rev-parse", "HEAD"], src) if src.exists() else None
+    exact_full_ok = sum(
+        1 for r in scans for a in r.get("attempts", [])
+        if a.get("mode") == "full-public-header-directory-exact-build-context"
+        and a.get("exit_code") == 0
+    )
+    clang_full_ok = sum(
+        1 for r in scans for a in r.get("attempts", [])
+        if a.get("mode") == "full-public-header-directory-clang-integrated"
+        and a.get("exit_code") == 0
+    )
+    full_ok = sum(
+        1 for r in scans
+        if any(
+            a.get("mode", "").startswith("full-public-header-directory-")
+            and a.get("exit_code") == 0
+            for a in r.get("attempts", [])
+        )
+    )
+    selected_ok = sum(1 for r in scans if r.get("selected_snapshot"))
+    header_selected_ok = sum(
+        1 for r in scans if (r.get("selected_stats") or {}).get("from_headers") is True
+    )
+    summary = {
+        "target": target,
+        "repository": config["repo"], "requested_ref": config["ref"],
+        "version": config["version"], "resolved_commit": commit,
+        "abicheck_version": command_output(["abicheck", "--version"]),
+        "clang_version": command_output(["clang", "--version"]).splitlines()[0],
+        "castxml_version": command_output(["castxml", "--version"]).splitlines()[0],
+        "source_metrics": source_metrics,
