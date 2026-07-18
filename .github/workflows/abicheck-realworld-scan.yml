@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        target: [onetbb]
+        target: [onednn]
     steps:
       - name: Checkout orchestration branch
         uses: actions/checkout@v4
@@ -64,9 +64,36 @@ jobs:
           new_parse = '-std=gnu++17 -frtti -fexceptions -Wno-error -Wno-unknown-warning-option'
           if text.count(old_parse) != 4:
               raise SystemExit("unexpected header-parse option count")
-          path.write_text(text.replace(old_parse, new_parse))
+          text = text.replace(old_parse, new_parse)
+          old_dedupe = "\n".join([
+              '    seen: set[tuple[int, int]] = set()',
+              '    out: list[Path] = []',
+              '    for path in sorted(candidates, key=lambda p: (p.name, str(p))):',
+              '        st = path.stat()',
+              '        key = (st.st_dev, st.st_ino)',
+              '        if key in seen:',
+              '            continue',
+              '        seen.add(key)',
+              '        out.append(path)',
+          ])
+          new_dedupe = "\n".join([
+              '    # Build and install trees often contain byte-identical copies. Scan each',
+              '    # unique ABI image once while the build/install tree manifests preserve',
+              '    # every path. This avoids repeating an expensive full-header AST parse.',
+              '    seen_content: set[str] = set()',
+              '    out: list[Path] = []',
+              '    for path in sorted(candidates, key=lambda p: (p.name, str(p))):',
+              '        digest = sha256_file(path)',
+              '        if digest in seen_content:',
+              '            continue',
+              '        seen_content.add(digest)',
+              '        out.append(path)',
+          ])
+          if old_dedupe not in text:
+              raise SystemExit("library de-duplication patch target not found")
+          path.write_text(text.replace(old_dedupe, new_dedupe))
           PY
-          echo "b8504b6925c9e6333502b4625f33cc1c38ab65f6c9c0db768d66aedefc89c355  ci/abicheck_realworld_scan.py" | sha256sum -c -
+          echo "57795a54118840bacecb13b7073c45e0e0ccc8b645d763450272de4861d814f6  ci/abicheck_realworld_scan.py" | sha256sum -c -
           base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
           python -m py_compile ci/abicheck_realworld_scan.py ci/aggregate_abicheck.py
 
