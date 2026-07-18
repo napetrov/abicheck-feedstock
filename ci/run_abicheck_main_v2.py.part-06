@@ -1,0 +1,105 @@
+    }, indent=2) + "\n", encoding="utf-8")
+
+    upstream_commit = ""
+    source_summary: dict[str, Any] = {}
+    headers_summary: dict[str, Any] = {}
+    compile_summary: dict[str, Any] = {}
+    pack_summary: dict[str, Any] = {}
+    libraries: list[Path] = []
+    library_rows: list[dict[str, Any]] = []
+    scans: list[dict[str, Any]] = []
+    raw_db = build / "compile_commands.json"
+    sanitized_db = build / "compile_commands.abicheck.json"
+
+    try:
+        if not re.fullmatch(r"[0-9a-f]{40}", args.abicheck_sha):
+            raise HarnessError("abicheck SHA is not an immutable 40-hex commit")
+        if not plugin_flags or "abicheck-facts" not in plugin_flags:
+            raise HarnessError("ABICHECK_PLUGIN_FLAGS is absent or does not identify libabicheck-facts")
+        upstream_commit = clone_source(target, src, work, logs, timings)
+        (out / "upstream-commit.txt").write_text(upstream_commit + "\n", encoding="utf-8")
+        source_summary = walk_source_inventory(src, out)
+        headers_summary = collect_public_headers(target, src, out)
+        build.mkdir(parents=True, exist_ok=True); install.mkdir(parents=True, exist_ok=True)
+        if target == "onedal":
+            build_onedal(src, build, install, work, out, logs, timings, plugin_flags, env, max(1, args.jobs))
+        else:
+            cmake_configure_build_install(target, src, build, install, logs, timings, plugin_flags, env, max(1, args.jobs))
+        if not raw_db.exists():
+            raise HarnessError(f"build produced no compilation database at {raw_db}")
+        sanitize_compile_db(raw_db, sanitized_db, out)
+        compile_summary = summarize_compile_db(sanitized_db, out)
+        pack_summary = validate_inputs_pack(pack, out, int(compile_summary.get("entries", 0)))
+        if pack_summary.get("status") != "valid":
+            raise HarnessError(f"Clang build-integration pack is not valid: {pack_summary}")
+        libraries, library_rows = locate_libraries(target, build, install)
+        write_elf_metadata(libraries, library_rows, out)
+        scans = run_scans(
+            target=target, src=src, build=build, pack=pack, libraries=libraries,
+            headers=public_headers(target, src), roots=public_roots(target, src),
+            sanitized_db=sanitized_db, out=out, logs=logs, timings=timings,
+            env=env, abicheck_sha=args.abicheck_sha,
+        )
+        invalid = [s for s in scans if s["returncode"] != 0 or not s["validation"].get("valid")]
+        if invalid:
+            raise HarnessError(f"{len(invalid)}/{len(scans)} source-depth snapshots failed validation")
+        summary["status"] = "complete"
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+        (out / "fatal-error.txt").write_text(
+            f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}", encoding="utf-8"
+        )
+    finally:
+        try:
+            pack_archive = archive_pack(pack, out, logs, timings, env)
+        except Exception as exc:
+            errors.append(f"pack archive: {type(exc).__name__}: {exc}"); pack_archive = {"status": "error", "error": str(exc)}
+        try:
+            trees = {
+                "build": manifest_tree(build, out / "build_tree.jsonl.gz"),
+                "install": manifest_tree(install, out / "install_tree.jsonl.gz"),
+                "build_integration": manifest_tree(pack, out / "build_integration_tree.jsonl.gz"),
+            }
+            write_json(out / "tree_manifest_summary.json", trees)
+        except Exception as exc:
+            errors.append(f"tree manifest: {type(exc).__name__}: {exc}"); trees = {}
+        write_timings(out, timings)
+        summary.update({
+            "finished_at": now_iso(), "upstream_commit": upstream_commit,
+            "source_inventory": source_summary, "public_headers": headers_summary,
+            "compile_db": compile_summary, "build_integration": {**pack_summary, **pack_archive},
+            "libraries": library_rows, "unique_library_count": len(libraries),
+            "library_path_count": len(libraries), "scans": scans,
+            "scan_wall_seconds": round(sum(float(s.get("wall_seconds", 0)) for s in scans), 6),
+            "timings": [asdict(x) for x in timings],
+        })
+        write_json(out / "summary.json", summary)
+        md = [
+            f"# {target} — abicheck main full-source scan", "",
+            f"- Status: **{summary['status']}**",
+            f"- abicheck main: `{args.abicheck_sha}`",
+            f"- abicheck version: `{summary['abicheck_version']}`",
+            f"- Upstream: `{TARGET_SPECS[target]['ref']}` / `{upstream_commit}`",
+            f"- Build integration: Clang facts plugin `{os.environ.get('ABICHECK_PRODUCER_VERSION', '')}`",
+            f"- Compile units: {compile_summary.get('entries', 0)}",
+            f"- Source inventory: {source_summary.get('files', 0)} files / {source_summary.get('lines', 0)} lines",
+            f"- Public headers: {headers_summary.get('files', 0)}",
+            f"- Unique DSOs: {len(libraries)}",
+            f"- Valid L0–L5 snapshots: {sum(1 for s in scans if s.get('validation', {}).get('valid'))}/{len(scans)}",
+            "",
+        ]
+        if errors:
+            md += ["## Errors", ""] + [f"- {e}" for e in errors] + [""]
+        if scans:
+            md += ["## Per-library snapshots", "", "| Library | Exit | Wall s | Valid | L3 units | L5 nodes |", "|---|---:|---:|---|---:|---:|"]
+            for s in scans:
+                v = s.get("validation", {})
+                md.append(f"| {s['library_name']} | {s['returncode']} | {s['wall_seconds']:.3f} | {v.get('valid')} | {v.get('l3_compile_units', 0)} | {v.get('l5_nodes', 0)} |")
+            md.append("")
+        (out / "summary.md").write_text("\n".join(md), encoding="utf-8")
+        checksum_manifest(out)
+    return 0 if summary["status"] == "complete" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
