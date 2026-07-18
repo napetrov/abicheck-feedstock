@@ -1,0 +1,82 @@
+        build_integration_summary = archive_build_integration_pack(
+            build_integration_pack, output, env, logs, timings
+        )
+        build_info = (
+            build_integration_pack
+            if (build_integration_pack / "manifest.json").exists()
+            else compile_db
+        )
+
+        _, compile_sources = compile_db_report(compile_db, output)
+        compile_db_summary = json.loads(
+            (output / "compile_db_summary.json").read_text(encoding="utf-8")
+        )
+        source_summary = inventory_source_tree(src, compile_sources, output)
+        public_summary = inventory_public_headers(src, public_dirs, output)
+        json_dump(
+            output / "public_inputs.json",
+            {
+                "headers": [str(p) for p in public_headers],
+                "directories": [str(p) for p in public_dirs],
+                "lang": target.lang,
+                "extra_dump_flags": list(target.extra_dump_flags),
+            },
+        )
+
+        build_manifest = tree_manifest(build, output / "build_tree.jsonl.gz")
+        install_manifest = tree_manifest(install, output / "install_tree.jsonl.gz")
+        json_dump(
+            output / "tree_manifest_summary.json",
+            {"build": build_manifest, "install": install_manifest},
+        )
+
+        all_library_paths, selected = discover_libraries(target, [install, build, src])
+        json_dump(output / "library_paths.json", all_library_paths)
+        for library in selected:
+            library_meta.append(library_metadata(library, output))
+        json_dump(output / "libraries.json", library_meta)
+
+        scans = scan_libraries(
+            target, selected, public_headers, public_dirs, src, compile_db,
+            build_info, env, logs, output, timings,
+        )
+        json_dump(output / "scans.json", scans)
+        status = "success" if scans and all(row.get("snapshot") for row in scans) else "partial"
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+        write_text(output / "fatal-error.txt", errors[-1] + "\n")
+    finally:
+        write_timings(timings, output)
+        summary = {
+            "target": target.name,
+            "status": status,
+            "started_or_collected_at": utc_now(),
+            "abicheck_main_sha": args.abicheck_sha,
+            "abicheck_version": abicheck_version,
+            "upstream_repo": target.repo,
+            "upstream_ref": target.ref,
+            "upstream_commit": upstream_commit,
+            "compiler": "clang",
+            "source_depth": "source",
+            "ast_frontend": "clang",
+            "compile_db": compile_db_summary,
+            "compile_db_sanitization": compile_db_sanitization,
+            "build_integration": build_integration_summary,
+            "source_inventory": source_summary,
+            "public_headers": public_summary,
+            "library_path_count": len(all_library_paths),
+            "unique_library_count": len(library_meta),
+            "libraries": library_meta,
+            "scans": scans,
+            "timings": timings,
+            "errors": errors,
+        }
+        json_dump(output / "summary.json", summary)
+        write_text(output / "summary.md", render_summary(summary))
+        file_checksums(output)
+        print(json.dumps(summary, indent=2))
+    return 0 if status == "success" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
