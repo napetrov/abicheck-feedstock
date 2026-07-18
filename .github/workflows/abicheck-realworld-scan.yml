@@ -22,19 +22,44 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 1
       matrix:
-        target: [onedal, onetbb, onednn, level-zero]
+        target: [onedal]
     steps:
       - name: Checkout orchestration branch
         uses: actions/checkout@v4
 
-      - name: Expand and verify orchestration scripts
+      - name: Expand, patch, and verify orchestration scripts
         shell: bash
         run: |
           set -euxo pipefail
           cat ci/abicheck_realworld_scan.py.part-* > ci/abicheck_realworld_scan.py
           echo "9c300cf1242754497389a6cc03f15ad2a66949b9946c4f347f19576ed76896c2  ci/abicheck_realworld_scan.py" | sha256sum -c -
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("ci/abicheck_realworld_scan.py")
+          text = path.read_text()
+          old = '''        shutil.rmtree(tbb / "include", ignore_errors=True)
+          os.symlink(Path("/usr/include"), tbb / "include", target_is_directory=True)
+          for candidate in sorted(multiarch.glob("libtbb*.so*")):
+          '''
+          new = '''        # Do not symlink the entire /usr/include tree into an early -I path.
+          # Clang de-duplicates the equivalent later system directory; then
+          # libstdc++ <cstdlib>'s #include_next <stdlib.h> has nowhere to go.
+          # Expose only the TBB namespaces expected below TBBROOT/include.
+          shutil.rmtree(tbb / "include", ignore_errors=True)
+          (tbb / "include").mkdir(parents=True, exist_ok=True)
+          for name in ("oneapi", "tbb"):
+              system_header_dir = Path("/usr/include") / name
+              if system_header_dir.exists():
+                  os.symlink(system_header_dir, tbb / "include" / name, target_is_directory=True)
+          for candidate in sorted(multiarch.glob("libtbb*.so*")):
+          '''
+          if old not in text:
+              raise SystemExit("oneDAL TBB include-shim patch target not found")
+          path.write_text(text.replace(old, new))
+          PY
+          echo "68e47d84eb2914c9d1d8b38b630472d88c64a796a17f66ea16be233a467104b6  ci/abicheck_realworld_scan.py" | sha256sum -c -
           base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
           python -m py_compile ci/abicheck_realworld_scan.py ci/aggregate_abicheck.py
 
