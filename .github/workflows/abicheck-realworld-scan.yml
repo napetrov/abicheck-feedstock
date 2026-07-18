@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        target: [onednn]
+        target: [onetbb]
     steps:
       - name: Checkout orchestration branch
         uses: actions/checkout@v4
@@ -61,7 +61,7 @@ jobs:
               raise SystemExit("oneDAL TBB include-shim patch target not found")
           text = text.replace(old, new)
           old_parse = '-std=gnu++17 -Wno-error -Wno-unknown-warning-option'
-          new_parse = '-std=gnu++17 -frtti -fexceptions -Wno-error -Wno-unknown-warning-option'
+          new_parse = '-std=gnu++17 -frtti -fexceptions -U__TBB_BUILD -U__TBBMALLOC_BUILD -U__TBBMALLOCPROXY_BUILD -U__TBBBIND_BUILD -U__TBB_USE_ITT_NOTIFY -Wno-error -Wno-unknown-warning-option'
           if text.count(old_parse) != 4:
               raise SystemExit("unexpected header-parse option count")
           text = text.replace(old_parse, new_parse)
@@ -93,7 +93,7 @@ jobs:
               raise SystemExit("library de-duplication patch target not found")
           path.write_text(text.replace(old_dedupe, new_dedupe))
           PY
-          echo "57795a54118840bacecb13b7073c45e0e0ccc8b645d763450272de4861d814f6  ci/abicheck_realworld_scan.py" | sha256sum -c -
+          echo "ae770f64a82bef5d8fb3a319151baf258ca686aa8ad16e58ecfbe79551dbdcc9  ci/abicheck_realworld_scan.py" | sha256sum -c -
           base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
           python -m py_compile ci/abicheck_realworld_scan.py ci/aggregate_abicheck.py
 
