@@ -1,4 +1,4 @@
-name: abicheck main oneAPI full-source scans
+name: abicheck main oneDAL corrected full-source scan
 
 on:
   pull_request:
@@ -33,7 +33,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          sha="$(git ls-remote --exit-code https://github.com/abicheck/abicheck.git refs/heads/main | awk '{print $1}')"
+          sha="ffa860cfc5e4c080905ee6a5eeb1947534e010be"
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$sha"
@@ -47,7 +47,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        target: [onedal, onetbb, onednn, level-zero]
+        target: [onedal]
 
     steps:
       - name: Checkout orchestration
@@ -59,6 +59,16 @@ jobs:
           set -euxo pipefail
           cat ci/run_abicheck_main_scan.py.part-* > ci/run_abicheck_main_scan.py
           echo "5d7c84a326e11fee155aafeb9d185a60f5920bfea754767ba59e7d70a0a4bf7b  ci/run_abicheck_main_scan.py" | sha256sum -c -
+          sed -i '/^    releasedir = install$/a\
+              # With REQCPU=sse2 the upstream dispatcher rule has an empty recipe: it\
+              # declares the generated header target but emits no line, so a parallel\
+              # consumer can observe a missing file.  An empty header is the correct\
+              # representation for the baseline-only dispatcher and makes the dependency\
+              # explicit before Bear starts the build.\
+              dispatcher_header = workdir / "oneapi/dal/_dal_cpu_dispatcher_gen.hpp"\
+              dispatcher_header.parent.mkdir(parents=True, exist_ok=True)\
+              dispatcher_header.write_text("#pragma once\\n", encoding="utf-8")' ci/run_abicheck_main_scan.py
+          echo "2682238d841cfb57595288e31ce48ce259dda6a715d0acd4c1f4f179f96e2218  ci/run_abicheck_main_scan.py" | sha256sum -c -
           python -m py_compile ci/run_abicheck_main_scan.py ci/aggregate_abicheck_main.py
 
       - name: Install Clang, build, and inspection tooling
