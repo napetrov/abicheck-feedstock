@@ -1,0 +1,157 @@
+        timed_out=timed_out,
+        measured_wall_seconds=round(wall, 6),
+        stdout=str(stdout_path.relative_to(logs.parent)),
+        stderr=str(stderr_path.relative_to(logs.parent)),
+        time_file=str(time_path.relative_to(logs.parent)),
+        time_metrics=parse_gnu_time(time_path),
+    )
+    timings.append(rec)
+    if check and (rc != 0 or timed_out):
+        raise HarnessError(f"{name} failed (exit={rc}, timed_out={timed_out}); see {stderr_path}")
+    return rec
+
+
+def simple_output(command: Sequence[str], cwd: Path | None = None, timeout: int = 30) -> str:
+    try:
+        p = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"<unavailable: {exc}>"
+    return (p.stdout + p.stderr).strip()
+
+
+def collect_environment(out: Path, abicheck_sha: str) -> None:
+    env = {
+        "collected_at": now_iso(),
+        "abicheck_main_sha_requested": abicheck_sha,
+        "platform": platform.platform(),
+        "python": sys.version,
+        "executable": sys.executable,
+        "cwd": os.getcwd(),
+        "runner_temp": os.environ.get("RUNNER_TEMP"),
+        "github": {k: os.environ.get(k) for k in (
+            "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA",
+            "GITHUB_REF", "GITHUB_WORKFLOW", "RUNNER_NAME", "RUNNER_OS", "RUNNER_ARCH",
+        )},
+        "cpu_count": os.cpu_count(),
+        "clang": simple_output(["clang", "--version"]),
+        "clangxx": simple_output(["clang++", "--version"]),
+        "cmake": simple_output(["cmake", "--version"]),
+        "ninja": simple_output(["ninja", "--version"]),
+        "bear": simple_output(["bear", "--version"]),
+        "abicheck": simple_output(["abicheck", "--version"]),
+        "castxml": simple_output(["castxml", "--version"]),
+        "git": simple_output(["git", "--version"]),
+        "lscpu": simple_output(["lscpu"]),
+        "df": simple_output(["df", "-h"]),
+        "meminfo": read_text_best_effort(Path("/proc/meminfo")),
+        "os_release": read_text_best_effort(Path("/etc/os-release")),
+        "plugin_so": os.environ.get("ABICHECK_PLUGIN_SO"),
+        "plugin_flags": os.environ.get("ABICHECK_PLUGIN_FLAGS"),
+        "producer_version": os.environ.get("ABICHECK_PRODUCER_VERSION"),
+        "parallelism": {k: os.environ.get(k) for k in (
+            "ABICHECK_L4_JOBS", "ABICHECK_CALL_GRAPH_JOBS", "ABICHECK_PATTERN_SCAN_JOBS",
+            "ABICHECK_L4_JOB_MEM_GIB", "ABICHECK_L4_EXECUTOR",
+        )},
+    }
+    write_json(out / "environment.json", env)
+    (out / "abicheck-version.txt").write_text(env["abicheck"] + "\n", encoding="utf-8")
+    (out / "abicheck-main-sha.txt").write_text(abicheck_sha + "\n", encoding="utf-8")
+    (out / "abicheck-import-path.txt").write_text(
+        simple_output([sys.executable, "-c", "import abicheck; print(abicheck.__file__)"]) + "\n",
+        encoding="utf-8",
+    )
+    (out / "abicheck-dump-help.txt").write_text(simple_output(["abicheck", "dump", "--help"], timeout=60) + "\n", encoding="utf-8")
+    (out / "pip-freeze.txt").write_text(simple_output([sys.executable, "-m", "pip", "freeze"], timeout=60) + "\n", encoding="utf-8")
+
+
+def clone_source(target: str, src: Path, work: Path, logs: Path, timings: list[CommandRecord]) -> str:
+    spec = TARGET_SPECS[target]
+    run_timed(
+        name="clone",
+        command=[
+            "git", "clone", "--depth", "1", "--branch", spec["ref"],
+            "--recurse-submodules", "--shallow-submodules", spec["repo"], str(src),
+        ],
+        cwd=work, logs=logs, timings=timings, timeout=900,
+    )
+    run_timed(
+        name="submodules",
+        command=["git", "submodule", "update", "--init", "--recursive", "--depth", "1"],
+        cwd=src, logs=logs, timings=timings, timeout=900,
+    )
+    commit = simple_output(["git", "rev-parse", "HEAD"], cwd=src)
+    return commit.splitlines()[0].strip()
+
+
+def walk_source_inventory(src: Path, out: Path) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    counts: dict[str, int] = {"source": 0, "header": 0, "other": 0}
+    total_lines = 0
+    total_bytes = 0
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        root_p = Path(root)
+        for name in sorted(files):
+            p = root_p / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            suffix = p.suffix.lower()
+            if suffix in SOURCE_SUFFIXES:
+                kind = "source"
+            elif suffix in HEADER_SUFFIXES:
+                kind = "header"
+            else:
+                continue
+            try:
+                data = p.read_bytes()
+            except OSError:
+                continue
+            lines = data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+            row = {
+                "path": str(p.relative_to(src)), "kind": kind, "suffix": suffix,
+                "size_bytes": len(data), "lines": lines,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            rows.append(row)
+            counts[kind] += 1
+            total_lines += lines
+            total_bytes += len(data)
+    csv_path = out / "source_inventory.csv.gz"
+    with gzip.open(csv_path, "wt", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["path", "kind", "suffix", "size_bytes", "lines", "sha256"])
+        w.writeheader(); w.writerows(rows)
+    summary = {
+        "files": len(rows), "source_files": counts["source"], "header_files": counts["header"],
+        "lines": total_lines, "bytes": total_bytes, "inventory": csv_path.name,
+    }
+    write_json(out / "source_inventory_summary.json", summary)
+    return summary
+
+
+def public_roots(target: str, src: Path) -> list[Path]:
+    return [src / p for p in TARGET_SPECS[target]["public_roots"] if (src / p).exists()]
+
+
+def public_headers(target: str, src: Path) -> list[Path]:
+    if target == "level-zero":
+        return sorted(p for p in (src / "include").glob("*.h") if p.is_file())
+    return [src / p for p in TARGET_SPECS[target]["headers"] if (src / p).is_file()]
+
+
+def collect_public_headers(target: str, src: Path, out: Path) -> dict[str, Any]:
+    roots = public_roots(target, src)
+    rows: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for root in roots:
+        for p in root.rglob("*"):
+            if p.is_file() and not p.is_symlink() and p.suffix.lower() in HEADER_SUFFIXES:
+                rp = p.resolve()
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                data = p.read_bytes()
+                rows.append({
+                    "path": str(p.relative_to(src)), "root": str(root.relative_to(src)),
+                    "size_bytes": len(data),
+                    "lines": data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0),
+                    "sha256": hashlib.sha256(data).hexdigest(),
