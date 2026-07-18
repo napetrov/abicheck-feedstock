@@ -1,0 +1,207 @@
+    }
+    if isinstance(data, dict):
+        summary.update(
+            {
+                key: data.get(key)
+                for key in (
+                    "schema_version", "version", "library_name", "soname",
+                    "from_headers", "ast_frontend", "header_backend",
+                    "created_at", "git_commit",
+                )
+                if key in data
+            }
+        )
+        for key in ("symbols", "functions", "variables", "types", "structs", "classes", "enums", "typedefs"):
+            value = data.get(key)
+            if isinstance(value, (list, dict)):
+                summary[f"{key}_count"] = len(value)
+        build_source = data.get("build_source")
+        if isinstance(build_source, dict):
+            manifest = build_source.get("manifest")
+            if isinstance(manifest, dict):
+                summary["source_manifest_coverage"] = manifest.get("coverage")
+                summary["source_manifest_extractors"] = manifest.get("extractors")
+            build_evidence = build_source.get("build_evidence")
+            if isinstance(build_evidence, dict):
+                units = build_evidence.get("compile_units")
+                targets = build_evidence.get("targets")
+                summary["l3_compile_units"] = len(units) if isinstance(units, (list, dict)) else 0
+                summary["l3_targets"] = len(targets) if isinstance(targets, (list, dict)) else 0
+            source_abi = build_source.get("source_abi")
+            if isinstance(source_abi, dict):
+                summary["l4_counts"] = {
+                    key: len(value)
+                    for key, value in source_abi.items()
+                    if isinstance(value, (list, dict))
+                }
+                summary["l4_coverage"] = source_abi.get("coverage")
+            source_graph = build_source.get("source_graph")
+            if isinstance(source_graph, dict):
+                nodes = source_graph.get("nodes")
+                edges = source_graph.get("edges")
+                summary["l5_nodes"] = len(nodes) if isinstance(nodes, (list, dict)) else 0
+                summary["l5_edges"] = len(edges) if isinstance(edges, (list, dict)) else 0
+        generic = find_key_recursive(
+            data,
+            {
+                "matched_symbols", "exported_symbols", "unmatched_symbols",
+                "accounted_symbols", "classified_symbols", "coverage",
+                "diagnostics",
+            },
+        )
+        summary["selected_recursive_metrics"] = generic
+    return summary
+
+
+def build_dump_command(
+    target: Target,
+    library: Path,
+    headers: Sequence[Path],
+    header_dirs: Sequence[Path],
+    src: Path,
+    compile_db: Path,
+    build_info: Path,
+    output_snapshot: Path | None,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    cmd = [
+        "abicheck", "dump", str(library),
+        "--lang", target.lang,
+        "--ast-frontend", "clang",
+        "--depth", "source",
+        "--sources", str(src),
+        "--build-info", str(build_info),
+        "--compile-db", str(compile_db),
+        "--version", target.ref,
+        "--git-tag", target.ref,
+        "--build-id", f"abicheck-main-{os.environ.get('ABICHECK_MAIN_SHA', 'unknown')}-{target.name}",
+    ]
+    for header in headers:
+        cmd += ["-H", str(header)]
+    for root in header_dirs:
+        cmd += ["--public-header-dir", str(root)]
+    cmd += list(target.extra_dump_flags)
+    if dry_run:
+        cmd.append("--dry-run")
+    elif output_snapshot is not None:
+        cmd += ["-o", str(output_snapshot)]
+    return cmd
+
+
+def scan_libraries(
+    target: Target,
+    libraries: Sequence[Path],
+    headers: Sequence[Path],
+    header_dirs: Sequence[Path],
+    src: Path,
+    compile_db: Path,
+    build_info: Path,
+    env: dict[str, str],
+    logs: Path,
+    output: Path,
+    timings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    snapshot_dir = output / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    for index, library in enumerate(libraries, 1):
+        digest = sha256_file(library)
+        slug = safe_slug(f"{index:02d}-{library.name}-{digest[:12]}")
+        dry_name = f"abicheck-{slug}-dry-run"
+        dry = run_timed(
+            dry_name,
+            build_dump_command(
+                target, library, headers, header_dirs, src, compile_db,
+                build_info, None, dry_run=True,
+            ),
+            cwd=src,
+            env=env,
+            logs=logs,
+            timeout=900,
+            allow_failure=True,
+        )
+        timings.append(command_record(dry))
+        snapshot = snapshot_dir / f"{slug}.abi.json"
+        run = run_timed(
+            f"abicheck-{slug}",
+            build_dump_command(
+                target, library, headers, header_dirs, src, compile_db,
+                build_info, snapshot, dry_run=False,
+            ),
+            cwd=src,
+            env=env,
+            logs=logs,
+            timeout=14400,
+            allow_failure=True,
+        )
+        timings.append(command_record(run))
+        record: dict[str, Any] = {
+            "library": str(library),
+            "library_sha256": digest,
+            "dry_run_returncode": dry.returncode,
+            "dry_run_timed_out": dry.timed_out,
+            "returncode": run.returncode,
+            "timed_out": run.timed_out,
+            "wall_seconds": run.wall_seconds,
+            "time_metrics": run.time_metrics,
+        }
+        if snapshot.exists():
+            snap_summary = snapshot_summary(snapshot)
+            record["snapshot"] = snap_summary
+            compressed = snapshot.with_suffix(snapshot.suffix + ".gz")
+            compress_copy(snapshot, compressed)
+            record["snapshot_gzip"] = str(compressed.relative_to(output))
+            record["snapshot_gzip_size_bytes"] = compressed.stat().st_size
+            record["snapshot_gzip_sha256"] = sha256_file(compressed)
+            snapshot.unlink()
+        else:
+            record["snapshot_error"] = "snapshot file not produced"
+        records.append(record)
+    return records
+
+
+def write_timings(timings: list[dict[str, Any]], output: Path) -> None:
+    json_dump(output / "timings.json", timings)
+    fields = [
+        "name", "returncode", "timed_out", "wall_seconds",
+        "user_seconds", "system_seconds", "elapsed_seconds", "max_rss_mib",
+        "started_at", "finished_at", "cwd", "command",
+    ]
+    with (output / "timings.csv").open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in timings:
+            metrics = row.get("time_metrics") or {}
+            writer.writerow(
+                {
+                    "name": row.get("name"),
+                    "returncode": row.get("returncode"),
+                    "timed_out": row.get("timed_out"),
+                    "wall_seconds": row.get("wall_seconds"),
+                    "user_seconds": metrics.get("user_seconds"),
+                    "system_seconds": metrics.get("system_seconds"),
+                    "elapsed_seconds": metrics.get("elapsed_seconds"),
+                    "max_rss_mib": metrics.get("max_rss_mib"),
+                    "started_at": row.get("started_at"),
+                    "finished_at": row.get("finished_at"),
+                    "cwd": row.get("cwd"),
+                    "command": shlex.join([str(x) for x in row.get("command", [])]),
+                }
+            )
+
+
+def file_checksums(root: Path) -> None:
+    files = [
+        path for path in sorted(root.rglob("*"))
+        if path.is_file() and path.name not in {"SHA256SUMS", "file_manifest.txt"}
+    ]
+    write_text(
+        root / "file_manifest.txt",
+        "\n".join(str(path.relative_to(root)) for path in files) + "\n",
+    )
+    lines = [f"{sha256_file(path)}  {path.relative_to(root)}" for path in files]
+    write_text(root / "SHA256SUMS", "\n".join(lines) + "\n")
+
+
+def render_summary(summary: Mapping[str, Any]) -> str:
