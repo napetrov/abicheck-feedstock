@@ -1,0 +1,309 @@
+    csv_path = out / "public_headers.csv.gz"
+    with gzip.open(csv_path, "wt", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["path", "root", "size_bytes", "lines", "sha256"])
+        w.writeheader(); w.writerows(sorted(rows, key=lambda x: x["path"]))
+    summary = {
+        "roots": [str(r.relative_to(src)) for r in roots],
+        "files": len(rows), "lines": sum(r["lines"] for r in rows),
+        "bytes": sum(r["size_bytes"] for r in rows), "inventory": csv_path.name,
+        "top_level_headers": [str(p.relative_to(src)) for p in public_headers(target, src)],
+    }
+    write_json(out / "public_headers_summary.json", summary)
+    return summary
+
+
+def cmake_configure_build_install(
+    target: str, src: Path, build: Path, install: Path, logs: Path,
+    timings: list[CommandRecord], plugin_flags: str, env: dict[str, str], jobs: int,
+) -> None:
+    options = [
+        "cmake", "-S", str(src), "-B", str(build), "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+        "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        f"-DCMAKE_INSTALL_PREFIX={install}",
+        f"-DCMAKE_C_FLAGS={plugin_flags}",
+        f"-DCMAKE_CXX_FLAGS={plugin_flags}",
+    ]
+    if target == "onetbb":
+        options += ["-DTBB_TEST=OFF", "-DTBB_STRICT=OFF"]
+    elif target == "onednn":
+        options += [
+            "-DDNNL_BUILD_TESTS=OFF", "-DDNNL_BUILD_EXAMPLES=OFF",
+            "-DDNNL_CPU_RUNTIME=TBB", "-DDNNL_GPU_RUNTIME=NONE",
+            "-DDNNL_ENABLE_GRAPH=ON", "-DDNNL_LIBRARY_TYPE=SHARED",
+        ]
+    elif target == "level-zero":
+        options += ["-DBUILD_TESTS=OFF"]
+    run_timed(name="cmake-configure", command=options, cwd=src, logs=logs, timings=timings, env=env, timeout=1800)
+    run_timed(name="build", command=["cmake", "--build", str(build), "--parallel", str(jobs)], cwd=src, logs=logs, timings=timings, env=env, timeout=14400)
+    run_timed(name="install", command=["cmake", "--install", str(build)], cwd=src, logs=logs, timings=timings, env=env, timeout=1800)
+
+
+def setup_onedal_deps(work: Path, out: Path) -> tuple[dict[str, str], dict[str, Any]]:
+    multiarch = simple_output(["gcc", "-print-multiarch"]).splitlines()[0].strip() or "x86_64-linux-gnu"
+    deps = work / "deps"
+    tbb = deps / "tbb"
+    openblas = deps / "openblas"
+    for p in (tbb / "include", tbb / "lib", openblas / "include", openblas / "lib"):
+        p.mkdir(parents=True, exist_ok=True)
+    for name in ("oneapi", "tbb"):
+        source = Path("/usr/include") / name
+        dest = tbb / "include" / name
+        if source.exists() and not dest.exists():
+            dest.symlink_to(source, target_is_directory=True)
+    libdir = Path("/usr/lib") / multiarch
+    for source in sorted(libdir.glob("libtbb*.so*")):
+        dest = tbb / "lib" / source.name
+        if not dest.exists():
+            dest.symlink_to(source)
+    for name in ("cblas.h", "f77blas.h", "openblas_config.h"):
+        candidates = [Path("/usr/include") / name, Path("/usr/include") / multiarch / name]
+        source = next((p for p in candidates if p.exists()), None)
+        if source is not None:
+            dest = openblas / "include" / name
+            if not dest.exists():
+                dest.symlink_to(source)
+    libopenblas = next(iter(sorted(libdir.glob("libopenblas*.a"))), None)
+    if libopenblas is None:
+        raise HarnessError(f"no static OpenBLAS archive under {libdir}")
+    (openblas / "lib" / "libopenblas.a").symlink_to(libopenblas)
+    env_add = {
+        "TBBROOT": str(tbb), "OPENBLASROOT": str(openblas),
+        "LD_LIBRARY_PATH": str(tbb / "lib") + os.pathsep + os.environ.get("LD_LIBRARY_PATH", ""),
+    }
+    meta = {
+        "multiarch": multiarch, "tbbroot": str(tbb), "openblasroot": str(openblas),
+        "tbb_entries": [str(p) for p in sorted(tbb.rglob("*"))],
+        "openblas_entries": [str(p) for p in sorted(openblas.rglob("*"))],
+        "environment": env_add,
+    }
+    write_json(out / "onedal-dependencies.json", meta)
+    return env_add, meta
+
+
+def build_onedal(
+    src: Path, build: Path, install: Path, work: Path, out: Path, logs: Path,
+    timings: list[CommandRecord], plugin_flags: str, env: dict[str, str], jobs: int,
+) -> None:
+    compiler_file = src / "dev/make/compiler_definitions/clang.ref.32e.mk"
+    original = compiler_file.read_text(encoding="utf-8")
+    patched = original.replace(
+        "COMPILER.mac.clang = $(COMPILER.mac.clang) -DDAAL_REF -DONEDAL_REF",
+        "COMPILER.mac.clang += -DDAAL_REF -DONEDAL_REF",
+    ).replace(
+        "COMPILER.lnx.clang = $(COMPILER.lnx.clang) -DDAAL_REF -DONEDAL_REF",
+        "COMPILER.lnx.clang += -DDAAL_REF -DONEDAL_REF",
+    )
+    if patched == original:
+        raise HarnessError("oneDAL clang.ref assignment patch did not match")
+    compiler_file.write_text(patched, encoding="utf-8")
+    (out / "onedal-clang-ref.patch").write_text(simple_output(["git", "diff", "--", str(compiler_file.relative_to(src))], cwd=src) + "\n", encoding="utf-8")
+    deps_env, _ = setup_onedal_deps(work, out)
+    build_work = build / "work"
+    dispatcher = build_work / "oneapi/dal/_dal_cpu_dispatcher_gen.hpp"
+    dispatcher.parent.mkdir(parents=True, exist_ok=True)
+    dispatcher.write_text("// baseline SSE2 dispatcher: no optional AVX macros\n", encoding="utf-8")
+    (out / "onedal-dispatcher-pregenerated.txt").write_text(str(dispatcher) + "\n" + dispatcher.read_text(), encoding="utf-8")
+    install.mkdir(parents=True, exist_ok=True)
+    build.mkdir(parents=True, exist_ok=True)
+    build_env = dict(env)
+    build_env.update(deps_env)
+    build_env["CXXFLAGS"] = plugin_flags
+    build_env["CFLAGS"] = ""
+    command = [
+        "bear", "--output", str(build / "compile_commands.json"), "--",
+        "make", "-f", "makefile", "onedal_c", f"-j{jobs}",
+        "PLAT=lnx32e", "COMPILER=clang", "BACKEND_CONFIG=ref", "OPTFLAG=O2",
+        "LINKER=lld", "REQDBG=symbols", "REQCPU=sse2", "STDALLOC=yes",
+        "BUILD_PARAMETERS_LIB=yes", f"WORKDIR={build_work}", f"RELEASEDIR={install}",
+    ]
+    run_timed(name="build", command=command, cwd=src, logs=logs, timings=timings, env=build_env, timeout=18000)
+
+
+def strip_plugin_tokens(argv: list[str]) -> tuple[list[str], int]:
+    out: list[str] = []
+    removed = 0
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("-fplugin=") and "abicheck-facts" in token:
+            removed += 1; i += 1; continue
+        if token == "-Xclang" and i + 1 < len(argv) and argv[i + 1] == "-plugin-arg-abicheck-facts":
+            removed += 2; i += 2
+            if i + 1 < len(argv) and argv[i] == "-Xclang":
+                removed += 2; i += 2
+            continue
+        out.append(token); i += 1
+    return out, removed
+
+
+def sanitize_compile_db(raw: Path, sanitized: Path, out: Path) -> dict[str, Any]:
+    data = json.loads(raw.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise HarnessError("compile_commands.json is not a list")
+    removed = 0
+    rewritten = 0
+    normalized: list[dict[str, Any]] = []
+    for entry in data:
+        e = dict(entry)
+        if isinstance(e.get("arguments"), list):
+            args, n = strip_plugin_tokens([str(x) for x in e["arguments"]])
+            e["arguments"] = args; removed += n
+        elif isinstance(e.get("command"), str):
+            args, n = strip_plugin_tokens(shlex.split(e["command"])); removed += n
+            e["command"] = shlex.join(args); rewritten += 1
+        normalized.append(e)
+    sanitized.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+    with raw.open("rb") as src_f, gzip.open(out / "compile_commands.raw.json.gz", "wb") as dst_f:
+        shutil.copyfileobj(src_f, dst_f)
+    with sanitized.open("rb") as src_f, gzip.open(out / "compile_commands.json.gz", "wb") as dst_f:
+        shutil.copyfileobj(src_f, dst_f)
+    summary = {
+        "entries": len(normalized), "plugin_tokens_removed": removed,
+        "command_entries_rewritten": rewritten, "raw_path": str(raw),
+        "sanitized_path": str(sanitized), "raw_sha256": sha256_file(raw),
+        "sanitized_sha256": sha256_file(sanitized),
+    }
+    write_json(out / "compile_db_sanitization.json", summary)
+    return summary
+
+
+def summarize_compile_db(path: Path, out: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    compilers: dict[str, int] = {}
+    languages: dict[str, int] = {}
+    sources: set[str] = set()
+    for e in data:
+        argv = e.get("arguments")
+        if not argv:
+            try: argv = shlex.split(e.get("command", ""))
+            except ValueError: argv = []
+        compiler = str(argv[0]) if argv else ""
+        compilers[compiler] = compilers.get(compiler, 0) + 1
+        source = str(e.get("file", "")); sources.add(source)
+        suffix = Path(source).suffix.lower()
+        lang = "c++" if suffix in {".cc", ".cpp", ".cxx", ".c++", ".mm"} else "c"
+        languages[lang] = languages.get(lang, 0) + 1
+    result = {
+        "path": str(path), "entries": len(data), "unique_sources": len(sources),
+        "compilers": compilers, "languages": languages, "sha256": sha256_file(path),
+    }
+    write_json(out / "compile_db_summary.json", result)
+    return result
+
+
+def attach_compile_db_to_inputs_pack(pack: Path, sanitized_db: Path, out: Path) -> dict[str, Any]:
+    """Make the Flow-2 pack self-contained at L3 as well as L4/L5."""
+    manifest_path = pack / "manifest.json"
+    if not manifest_path.is_file():
+        raise HarnessError(f"inputs pack has no manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    build_dir = pack / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    destination = build_dir / "compile_commands.json"
+    shutil.copy2(sanitized_db, destination)
+    manifest["compile_db"] = "build/compile_commands.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    result = {
+        "source": str(sanitized_db),
+        "destination": str(destination),
+        "entries": len(json.loads(destination.read_text(encoding="utf-8"))),
+        "sha256": sha256_file(destination),
+        "manifest_compile_db": manifest["compile_db"],
+    }
+    write_json(out / "build_integration_compile_db_attachment.json", result)
+    return result
+
+
+def source_paths_from_inputs_pack(pack: Path) -> set[str]:
+    sources: set[str] = set()
+    source_root = pack / "source_facts"
+    if not source_root.exists():
+        return sources
+    for path in sorted(source_root.glob("*.json*")):
+        try:
+            if path.suffix == ".gz":
+                text = gzip.open(path, "rt", encoding="utf-8").read()
+            else:
+                text = path.read_text(encoding="utf-8")
+        except (OSError, EOFError, UnicodeDecodeError):
+            continue
+        stripped = text.strip()
+        if not stripped:
+            continue
+        try:
+            whole = json.loads(stripped)
+            objects = whole if isinstance(whole, list) else [whole]
+        except json.JSONDecodeError:
+            objects = []
+            for line in text.splitlines():
+                try:
+                    objects.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        for obj in objects:
+            if isinstance(obj, dict) and obj.get("source"):
+                try:
+                    sources.add(str(Path(str(obj["source"])).resolve()))
+                except OSError:
+                    sources.add(str(obj["source"]))
+    return sources
+
+
+def compile_db_source_paths(compile_db: Path) -> set[str]:
+    data = json.loads(compile_db.read_text(encoding="utf-8"))
+    sources: set[str] = set()
+    for entry in data:
+        if not isinstance(entry, dict) or not entry.get("file"):
+            continue
+        source = Path(str(entry["file"]))
+        if not source.is_absolute():
+            source = Path(str(entry.get("directory") or compile_db.parent)) / source
+        try:
+            sources.add(str(source.resolve()))
+        except OSError:
+            sources.add(str(source))
+    return sources
+
+
+def validate_inputs_pack(
+    pack: Path, out: Path, expected_compile_units: int, compile_db: Path,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "path": str(pack), "status": "invalid", "tu_count": 0,
+        "expected_compile_units": expected_compile_units,
+    }
+    try:
+        from abicheck.buildsource.inputs_validate import validate_inputs_pack as _validate
+        report = _validate(pack)
+        db_sources = compile_db_source_paths(compile_db)
+        fact_sources = source_paths_from_inputs_pack(pack)
+        matched = db_sources & fact_sources
+        missing = sorted(db_sources - fact_sources)
+        extra = sorted(fact_sources - db_sources)
+        ratio = (float(len(matched)) / len(db_sources)) if db_sources else 0.0
+        result.update({
+            "errors": list(report.errors),
+            "warnings": list(report.warnings),
+            "tu_count": int(report.tu_count),
+            "compile_db_unique_sources": len(db_sources),
+            "fact_unique_sources": len(fact_sources),
+            "matched_compile_db_sources": len(matched),
+            "compile_unit_coverage_ratio": round(ratio, 6),
+            "missing_compile_db_sources": missing,
+            "extra_fact_sources": extra,
+            "status": "valid"
+            if not report.errors and report.tu_count > 0 and ratio >= 0.80
+            else "invalid",
+        })
+        if db_sources and ratio < 0.80:
+            result.setdefault("errors", []).append(
+                f"build-integration pack covers only {len(matched)}/{len(db_sources)} "
+                f"compile-db sources ({ratio:.1%}); expected at least 80%"
+            )
+    except Exception as exc:
+        result["exception"] = f"{type(exc).__name__}: {exc}"
+    manifest = pack / "manifest.json"
