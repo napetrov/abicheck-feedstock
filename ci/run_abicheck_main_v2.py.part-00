@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Reproducible oneAPI ABI evidence run against one immutable abicheck main SHA.
+
+Builds oneDAL/oneTBB/oneDNN/Level Zero with Clang + the exact-main Clang facts
+plugin, captures the real compilation database, then performs a separate cold
+full source replay (`abicheck dump --sources --depth source --ast-frontend clang`).
+Every command is timed with GNU time -v and all diagnostics are retained.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import traceback
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm"}
+HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".tcc"}
+SKIP_DIRS = {
+    ".git", ".github", ".idea", ".vscode", "__pycache__", "build", "_build",
+    "cmake-build-debug", "install",
+}
+TARGET_SPECS: dict[str, dict[str, Any]] = {
+    "onedal": {
+        "repo": "https://github.com/uxlfoundation/oneDAL.git",
+        "ref": "2026.1.0",
+        "public_roots": ["cpp/oneapi", "cpp/daal/include"],
+        "headers": ["cpp/oneapi/dal.hpp", "cpp/daal/include/daal.h"],
+    },
+    "onetbb": {
+        "repo": "https://github.com/uxlfoundation/oneTBB.git",
+        "ref": "v2023.0.0",
+        "public_roots": ["include"],
+        "headers": [
+            "include/oneapi/tbb.h",
+            "include/oneapi/tbb/scalable_allocator.h",
+            "include/oneapi/tbb/tbbmalloc_proxy.h",
+            "include/oneapi/tbb/global_control.h",
+            "include/tbb/tbb.h",
+        ],
+    },
+    "onednn": {
+        "repo": "https://github.com/uxlfoundation/oneDNN.git",
+        "ref": "v3.12",
+        "public_roots": ["include"],
+        "headers": [
+            "include/oneapi/dnnl/dnnl.h",
+            "include/oneapi/dnnl/dnnl.hpp",
+            "include/oneapi/dnnl/dnnl_graph.h",
+            "include/oneapi/dnnl/dnnl_graph.hpp",
+            "include/oneapi/dnnl/dnnl_types.h",
+        ],
+    },
+    "level-zero": {
+        "repo": "https://github.com/oneapi-src/level-zero.git",
+        "ref": "v1.32.0",
+        "public_roots": ["include"],
+        "headers": [],  # resolved as every top-level public include/*.h
+    },
+}
+
+
+@dataclass
+class CommandRecord:
+    name: str
+    command: list[str]
+    cwd: str
+    started_at: str
+    finished_at: str
+    returncode: int
+    timed_out: bool
+    measured_wall_seconds: float
+    stdout: str
+    stderr: str
+    time_file: str
+    time_metrics: dict[str, Any]
+
+
+class HarnessError(RuntimeError):
+    pass
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def sha256_file(path: Path, chunk: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while data := f.read(chunk):
+            h.update(data)
+    return h.hexdigest()
+
+
+def write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def read_text_best_effort(path: Path, limit: int | None = None) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text if limit is None else text[-limit:]
+
+
+def parse_gnu_time(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {"raw": {}}
+    if not path.exists():
+        return result
+    raw: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if ": " in line:
+            k, v = line.strip().split(": ", 1)
+            raw[k] = v
+    result["raw"] = raw
+    keys = {
+        "User time (seconds)": ("user_seconds", float),
+        "System time (seconds)": ("system_seconds", float),
+        "Maximum resident set size (kbytes)": ("max_rss_kib", int),
+        "Major (requiring I/O) page faults": ("major_page_faults", int),
+        "Minor (reclaiming a frame) page faults": ("minor_page_faults", int),
+        "Voluntary context switches": ("voluntary_context_switches", int),
+        "Involuntary context switches": ("involuntary_context_switches", int),
+        "File system inputs": ("filesystem_inputs", int),
+        "File system outputs": ("filesystem_outputs", int),
+        "Exit status": ("time_exit_status", int),
+    }
+    for source, (dest, typ) in keys.items():
+        if source in raw:
+            try:
+                result[dest] = typ(raw[source])
+            except (TypeError, ValueError):
+                pass
+    if "max_rss_kib" in result:
+        result["max_rss_mib"] = round(result["max_rss_kib"] / 1024.0, 3)
+    return result
+
+
+def run_timed(
+    *,
+    name: str,
+    command: Sequence[str],
+    cwd: Path,
+    logs: Path,
+    timings: list[CommandRecord],
+    env: Mapping[str, str] | None = None,
+    timeout: int = 3600,
+    check: bool = True,
+) -> CommandRecord:
+    logs.mkdir(parents=True, exist_ok=True)
+    stdout_path = logs / f"{name}.stdout.log"
+    stderr_path = logs / f"{name}.stderr.log"
+    time_path = logs / f"{name}.time.txt"
+    command_path = logs / f"{name}.command.txt"
+    cmd = [str(x) for x in command]
+    started = now_iso()
+    start = dt.datetime.now(dt.timezone.utc)
+    command_path.write_text(
+        f"cwd={cwd}\nstarted={started}\ncommand={shlex.join(cmd)}\n",
+        encoding="utf-8",
+    )
+    full_cmd = ["/usr/bin/time", "-v", "-o", str(time_path), "--", *cmd]
+    timed_out = False
+    rc = 127
+    with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
+        proc = subprocess.Popen(
+            full_cmd,
+            cwd=cwd,
+            env=dict(env) if env is not None else None,
+            stdout=out,
+            stderr=err,
+            start_new_session=True,
+        )
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                rc = proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                rc = proc.wait(timeout=20)
+    finished = now_iso()
+    wall = (dt.datetime.now(dt.timezone.utc) - start).total_seconds()
+    command_path.write_text(
+        command_path.read_text(encoding="utf-8")
+        + f"finished={finished}\nreturncode={rc}\ntimed_out={timed_out}\nmeasured_wall_seconds={wall:.6f}\n",
+        encoding="utf-8",
+    )
+    rec = CommandRecord(
+        name=name,
+        command=cmd,
+        cwd=str(cwd),
+        started_at=started,
+        finished_at=finished,
+        returncode=rc,
