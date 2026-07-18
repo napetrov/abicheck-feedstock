@@ -1,0 +1,212 @@
+) -> dict[str, Any]:
+    seen: set[Path] = set()
+    rows: list[dict[str, Any]] = []
+    for root in header_dirs:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in HEADER_SUFFIXES:
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            rows.append(
+                {
+                    "path": str(path.relative_to(src)),
+                    "root": str(root.relative_to(src)),
+                    "size_bytes": path.stat().st_size,
+                    "lines": count_lines(path),
+                    "sha256": sha256_file(path),
+                }
+            )
+    csv_path = output / "public_headers.csv.gz"
+    with gzip.open(csv_path, "wt", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["path", "root", "size_bytes", "lines", "sha256"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        "files": len(rows),
+        "total_bytes": sum(int(r["size_bytes"]) for r in rows),
+        "total_lines": sum(int(r["lines"] or 0) for r in rows),
+        "roots": [str(p.relative_to(src)) for p in header_dirs],
+    }
+    json_dump(output / "public_headers_summary.json", summary)
+    return summary
+
+
+def tree_manifest(root: Path, output: Path) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    if root.exists():
+        for path in sorted(root.rglob("*")):
+            try:
+                rel = path.relative_to(root)
+                if path.is_symlink():
+                    rows.append(
+                        {
+                            "path": str(rel),
+                            "type": "symlink",
+                            "target": os.readlink(path),
+                        }
+                    )
+                elif path.is_file():
+                    rows.append(
+                        {
+                            "path": str(rel),
+                            "type": "file",
+                            "size_bytes": path.stat().st_size,
+                            "sha256": sha256_file(path),
+                        }
+                    )
+                elif path.is_dir():
+                    rows.append({"path": str(rel), "type": "directory"})
+            except OSError as exc:
+                rows.append({"path": str(path), "type": "error", "error": str(exc)})
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(output, "wt", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    return {
+        "root": str(root),
+        "entries": len(rows),
+        "files": sum(1 for row in rows if row.get("type") == "file"),
+        "bytes": sum(int(row.get("size_bytes", 0)) for row in rows),
+    }
+
+
+def is_elf(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def discover_libraries(
+    target: Target,
+    roots: Sequence[Path],
+) -> tuple[list[dict[str, Any]], list[Path]]:
+    regex = re.compile(target.library_regex)
+    all_paths: list[dict[str, Any]] = []
+    by_digest: dict[str, list[Path]] = {}
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.so*")):
+            if not path.is_file() or not regex.match(path.name):
+                continue
+            try:
+                real = path.resolve()
+            except OSError:
+                real = path
+            if not is_elf(real):
+                continue
+            digest = sha256_file(real)
+            all_paths.append(
+                {
+                    "path": str(path),
+                    "realpath": str(real),
+                    "sha256": digest,
+                    "size_bytes": real.stat().st_size,
+                    "symlink": path.is_symlink(),
+                    "root": str(root),
+                }
+            )
+            by_digest.setdefault(digest, []).append(path)
+    selected: list[Path] = []
+    for digest, paths in sorted(by_digest.items()):
+        del digest
+        # Prefer an installed/release path, then a versioned non-symlink.
+        ranked = sorted(
+            paths,
+            key=lambda p: (
+                0 if any(part in {"install", "release", "daal"} for part in p.parts) else 1,
+                0 if not p.is_symlink() else 1,
+                -len(p.name),
+                str(p),
+            ),
+        )
+        selected.append(ranked[0].resolve())
+    if not selected:
+        raise HarnessError(f"no ELF libraries matching {target.library_regex}")
+    return all_paths, selected
+
+
+def readelf_text(path: Path, args: Sequence[str]) -> str:
+    proc = run_capture(["readelf", *args, str(path)], timeout=180)
+    return proc.stdout + proc.stderr
+
+
+def library_metadata(path: Path, output: Path) -> dict[str, Any]:
+    slug = safe_slug(path.name + "-" + sha256_file(path)[:12])
+    meta_dir = output / "elf" / slug
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    file_proc = run_capture(["file", "-L", str(path)], timeout=30)
+    ldd_proc = run_capture(["ldd", str(path)], timeout=120)
+    header = readelf_text(path, ["-h"])
+    dynamic = readelf_text(path, ["-d"])
+    notes = readelf_text(path, ["-n"])
+    sections = readelf_text(path, ["-SW"])
+    dynsyms = readelf_text(path, ["--dyn-syms", "--wide"])
+    nm_proc = run_capture(["nm", "-D", "--defined-only", "--format=posix", str(path)], timeout=180)
+    write_text(meta_dir / "file.txt", file_proc.stdout + file_proc.stderr)
+    write_text(meta_dir / "ldd.txt", ldd_proc.stdout + ldd_proc.stderr)
+    write_text(meta_dir / "readelf-header.txt", header)
+    write_text(meta_dir / "readelf-dynamic.txt", dynamic)
+    write_text(meta_dir / "readelf-notes.txt", notes)
+    write_text(meta_dir / "readelf-sections.txt", sections)
+    write_text(meta_dir / "readelf-dynsyms.txt", dynsyms)
+    write_text(meta_dir / "nm-defined.txt", nm_proc.stdout + nm_proc.stderr)
+    soname_match = SONAME_RE.search(dynamic)
+    build_id_match = BUILD_ID_RE.search(notes)
+    section_names = set(re.findall(r"\[\s*\d+\]\s+(\S+)", sections))
+    defined = [
+        line for line in nm_proc.stdout.splitlines()
+        if line.strip() and not line.lstrip().startswith("nm:")
+    ]
+    return {
+        "path": str(path),
+        "name": path.name,
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+        "soname": soname_match.group(1) if soname_match else None,
+        "build_id": build_id_match.group(1) if build_id_match else None,
+        "has_dwarf": any(name.startswith(".debug_") or name.startswith(".zdebug_") for name in section_names),
+        "sections": sorted(section_names),
+        "defined_dynamic_symbols": len(defined),
+        "metadata_dir": str(meta_dir.relative_to(output)),
+    }
+
+
+def find_key_recursive(obj: Any, keys: set[str]) -> dict[str, Any]:
+    found: dict[str, Any] = {}
+    stack = [obj]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in keys and key not in found:
+                    found[key] = value
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(x for x in current if isinstance(x, (dict, list)))
+    return found
+
+
+def snapshot_summary(path: Path) -> dict[str, Any]:
+    size = path.stat().st_size
+    digest = sha256_file(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "path": str(path),
+            "size_bytes": size,
+            "sha256": digest,
+            "parse_error": str(exc),
+        }
+    summary: dict[str, Any] = {
+        "path": str(path),
+        "size_bytes": size,
+        "sha256": digest,
