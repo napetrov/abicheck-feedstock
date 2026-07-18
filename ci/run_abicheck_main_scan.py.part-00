@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Build oneAPI projects with Clang and collect abicheck main L0-L5 evidence.
+
+This is a deliberately self-contained CI harness.  It:
+* builds one target from a pinned upstream ref with Clang + debug information;
+* captures or generates compile_commands.json;
+* inventories the entire source tree and every public header;
+* runs abicheck dump with --ast-frontend clang, exact compile DB, and
+  --sources/--depth source (L0-L5);
+* captures GNU time -v, stdout/stderr, ELF metadata, snapshots, checksums,
+  and machine-readable summaries.
+
+The installed abicheck checkout and exact main SHA are supplied by the workflow.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+
+SOURCE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm",
+    ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp",
+}
+HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tpp"}
+SKIP_DIR_NAMES = {
+    ".git", ".github", ".cache", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache",
+}
+TIME_RE = re.compile(r"^([^:]+):\s*(.*?)\s*$")
+SONAME_RE = re.compile(r"\(SONAME\).*\[(.*?)\]")
+BUILD_ID_RE = re.compile(r"Build ID:\s*([0-9a-fA-F]+)")
+
+
+@dataclass(frozen=True)
+class Target:
+    name: str
+    repo: str
+    ref: str
+    lang: str
+    library_regex: str
+    cmake_args: tuple[str, ...] = ()
+    public_headers: tuple[str, ...] = ()
+    public_header_dirs: tuple[str, ...] = ()
+    extra_dump_flags: tuple[str, ...] = ()
+    build_kind: str = "cmake"
+
+
+TARGETS: dict[str, Target] = {
+    "onetbb": Target(
+        name="onetbb",
+        repo="https://github.com/uxlfoundation/oneTBB.git",
+        ref="v2023.0.0",
+        lang="c++",
+        library_regex=r"^lib(?:tbb|tbbmalloc|tbbmalloc_proxy|tbbbind).*\.so(?:\..*)?$",
+        cmake_args=(
+            "-DTBB_TEST=OFF",
+            "-DTBB_EXAMPLES=OFF",
+            "-DTBB_STRICT=OFF",
+            "-DTBB_ENABLE_IPO=OFF",
+        ),
+        public_headers=("include/oneapi/tbb.h",),
+        public_header_dirs=("include",),
+        extra_dump_flags=(
+            "--gcc-option=-frtti",
+            "--gcc-option=-fexceptions",
+            "--gcc-option=-U__TBB_BUILD",
+            "--gcc-option=-U__TBBMALLOC_BUILD",
+            "--gcc-option=-U__TBBMALLOCPROXY_BUILD",
+            "--gcc-option=-U__TBBBIND_BUILD",
+            "--gcc-option=-U__TBB_USE_ITT_NOTIFY",
+        ),
+    ),
+    "onednn": Target(
+        name="onednn",
+        repo="https://github.com/uxlfoundation/oneDNN.git",
+        ref="v3.12",
+        lang="c++",
+        library_regex=r"^libdnnl.*\.so(?:\..*)?$",
+        cmake_args=(
+            "-DONEDNN_LIBRARY_TYPE=SHARED",
+            "-DONEDNN_CPU_RUNTIME=TBB",
+            "-DONEDNN_GPU_RUNTIME=NONE",
+            "-DONEDNN_BUILD_TESTS=OFF",
+            "-DONEDNN_BUILD_EXAMPLES=OFF",
+            "-DONEDNN_BUILD_DOC=OFF",
+            "-DONEDNN_BUILD_GRAPH=ON",
+            "-DONEDNN_ENABLE_ITT_TASKS=OFF",
+            "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF",
+        ),
+        public_headers=(
+            "include/oneapi/dnnl/dnnl.h",
+            "include/oneapi/dnnl/dnnl.hpp",
+            "include/oneapi/dnnl/dnnl_graph.h",
+            "include/oneapi/dnnl/dnnl_graph.hpp",
+        ),
+        public_header_dirs=("include",),
+    ),
+    "level-zero": Target(
+        name="level-zero",
+        repo="https://github.com/oneapi-src/level-zero.git",
+        ref="v1.32.0",
+        lang="c",
+        library_regex=r"^libze.*\.so(?:\..*)?$",
+        cmake_args=(
+            "-DBUILD_TESTS=OFF",
+        ),
+        # Populated dynamically with every regular header directly under include/.
+        public_headers=(),
+        public_header_dirs=("include",),
+    ),
+    "onedal": Target(
+        name="onedal",
+        repo="https://github.com/uxlfoundation/oneDAL.git",
+        ref="2026.1.0",
+        lang="c++",
+        library_regex=r"^lib(?:onedal|daal).*\.so(?:\..*)?$",
+        public_headers=(
+            "cpp/oneapi/dal.hpp",
+            "cpp/daal/include/daal.h",
+        ),
+        public_header_dirs=(
+            "cpp/oneapi",
+            "cpp/daal/include",
+        ),
+        build_kind="onedal",
+    ),
+}
+
+
+@dataclass
+class CommandResult:
+    name: str
+    command: list[str]
+    cwd: str
+    started_at: str
+    finished_at: str
+    returncode: int
+    timed_out: bool
+    wall_seconds: float
+    stdout: str
+    stderr: str
+    time_file: str
+    time_metrics: dict[str, Any] = field(default_factory=dict)
+
+
+class HarnessError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def sha256_file(path: Path, chunk: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for data in iter(lambda: fh.read(chunk), b""):
+            h.update(data)
+    return h.hexdigest()
+
+
+def safe_slug(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return value.strip("._") or "item"
+
+
+def json_dump(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", errors="replace")
+
+
+def run_capture(
+    argv: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(argv),
+        cwd=str(cwd) if cwd else None,
+        env=dict(env) if env else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def parse_elapsed(value: str) -> float | None:
+    try:
+        pieces = value.split(":")
+        if len(pieces) == 3:
+            return float(pieces[0]) * 3600 + float(pieces[1]) * 60 + float(pieces[2])
+        if len(pieces) == 2:
+            return float(pieces[0]) * 60 + float(pieces[1])
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_gnu_time(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    raw: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = TIME_RE.match(line.strip())
+        if match:
+            raw[match.group(1).strip()] = match.group(2).strip()
+    out: dict[str, Any] = {"raw": raw}
+    aliases = {
+        "User time (seconds)": ("user_seconds", float),
+        "System time (seconds)": ("system_seconds", float),
+        "Maximum resident set size (kbytes)": ("max_rss_kib", int),
+        "Minor (reclaiming a frame) page faults": ("minor_page_faults", int),
+        "Major (requiring I/O) page faults": ("major_page_faults", int),
+        "File system inputs": ("filesystem_inputs", int),
+        "File system outputs": ("filesystem_outputs", int),
+        "Voluntary context switches": ("voluntary_context_switches", int),
+        "Involuntary context switches": ("involuntary_context_switches", int),
+        "Exit status": ("time_exit_status", int),
+    }
+    for key, (dest, conv) in aliases.items():
+        if key in raw:
+            try:
+                out[dest] = conv(raw[key])
+            except ValueError:
+                pass
+    elapsed_key = next((k for k in raw if k.startswith("Elapsed (wall clock) time")), None)
+    if elapsed_key:
+        elapsed = parse_elapsed(raw[elapsed_key])
+        if elapsed is not None:
+            out["elapsed_seconds"] = elapsed
+    if "max_rss_kib" in out:
+        out["max_rss_mib"] = round(out["max_rss_kib"] / 1024.0, 3)
