@@ -1,0 +1,122 @@
+    *, target: str, src: Path, build: Path, pack: Path, libraries: list[Path],
+    headers: list[Path], roots: list[Path], sanitized_db: Path, out: Path,
+    logs: Path, timings: list[CommandRecord], env: dict[str, str], abicheck_sha: str,
+) -> list[dict[str, Any]]:
+    snapshots = out / "snapshots"; snapshots.mkdir(parents=True, exist_ok=True)
+    scans: list[dict[str, Any]] = []
+    if not headers: raise HarnessError(f"no public top-level headers resolved for {target}")
+    if not libraries: raise HarnessError(f"no unique ELF DSOs found for {target}")
+    common = [
+        "--lang", "c++", "--ast-frontend", "clang", "--depth", "source",
+        "--sources", str(src), "--build-info", str(pack), "--compile-db", str(sanitized_db),
+        "--version", str(TARGET_SPECS[target]["ref"]), "--git-tag", str(TARGET_SPECS[target]["ref"]),
+        "--build-id", f"abicheck-main-{abicheck_sha[:12]}-{target}",
+    ]
+    for r in roots: common += ["--public-header-dir", str(r)]
+    for inc in scan_include_dirs(target, src, build): common += ["-I", str(inc)]
+    for token in scan_gcc_option_tokens(target): common += ["--gcc-option", token]
+    for index, lib in enumerate(libraries, 1):
+        lib_headers = scan_headers_for_library(target, src, lib)
+        if not lib_headers:
+            raise HarnessError(f"no public umbrella headers resolved for {lib}")
+        lib_common = [*common]
+        for h in lib_headers: lib_common += ["-H", str(h)]
+        key = f"{index:02d}-{lib.name}-{sha256_file(lib)[:12]}"
+        dry_cmd = ["abicheck", "dump", str(lib), *lib_common, "--dry-run"]
+        dry = run_timed(name=f"abicheck-{key}-dry-run", command=dry_cmd, cwd=src, logs=logs, timings=timings, env=env, timeout=600, check=False)
+        snapshot = snapshots / f"{key}.abi.json"
+        cmd = ["abicheck", "dump", str(lib), *lib_common, "-o", str(snapshot)]
+        rec = run_timed(name=f"abicheck-{key}", command=cmd, cwd=src, logs=logs, timings=timings, env=env, timeout=18000, check=False)
+        validation = snapshot_validation(snapshot)
+        scan = {
+            "library": str(lib), "library_name": lib.name, "dry_run_returncode": dry.returncode,
+            "returncode": rec.returncode, "timed_out": rec.timed_out,
+            "wall_seconds": rec.measured_wall_seconds, "time_metrics": rec.time_metrics,
+            "snapshot": str(snapshot.relative_to(out)) if snapshot.exists() else None,
+            "validation": validation,
+        }
+        scans.append(scan)
+        write_json(snapshots / f"{key}.validation.json", validation)
+    write_json(out / "scans.json", scans)
+    return scans
+
+
+def write_timings(out: Path, timings: list[CommandRecord]) -> None:
+    rows = [asdict(x) for x in timings]
+    write_json(out / "timings.json", rows)
+    fields = [
+        "name", "returncode", "timed_out", "measured_wall_seconds", "user_seconds",
+        "system_seconds", "max_rss_mib", "major_page_faults", "minor_page_faults",
+        "voluntary_context_switches", "involuntary_context_switches", "filesystem_inputs",
+        "filesystem_outputs", "cwd", "command",
+    ]
+    with (out / "timings.csv").open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+        for rec in rows:
+            tm = rec.get("time_metrics") or {}
+            w.writerow({
+                "name": rec["name"], "returncode": rec["returncode"], "timed_out": rec["timed_out"],
+                "measured_wall_seconds": rec["measured_wall_seconds"],
+                "user_seconds": tm.get("user_seconds"), "system_seconds": tm.get("system_seconds"),
+                "max_rss_mib": tm.get("max_rss_mib"), "major_page_faults": tm.get("major_page_faults"),
+                "minor_page_faults": tm.get("minor_page_faults"),
+                "voluntary_context_switches": tm.get("voluntary_context_switches"),
+                "involuntary_context_switches": tm.get("involuntary_context_switches"),
+                "filesystem_inputs": tm.get("filesystem_inputs"), "filesystem_outputs": tm.get("filesystem_outputs"),
+                "cwd": rec["cwd"], "command": shlex.join(rec["command"]),
+            })
+
+
+def checksum_manifest(out: Path) -> None:
+    files = sorted(p for p in out.rglob("*") if p.is_file() and p.name not in {"SHA256SUMS", "file_manifest.txt"})
+    (out / "file_manifest.txt").write_text("".join(str(p.relative_to(out)) + "\n" for p in files), encoding="utf-8")
+    with (out / "SHA256SUMS").open("w", encoding="utf-8") as f:
+        for p in files:
+            f.write(f"{sha256_file(p)}  {p.relative_to(out)}\n")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", choices=sorted(TARGET_SPECS), required=True)
+    ap.add_argument("--abicheck-sha", required=True)
+    ap.add_argument("--output-root", type=Path, required=True)
+    ap.add_argument("--jobs", type=int, default=2)
+    args = ap.parse_args()
+
+    target = args.target
+    out = args.output_root.resolve() / target
+    out.mkdir(parents=True, exist_ok=True)
+    logs = out / "logs"; logs.mkdir(parents=True, exist_ok=True)
+    runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp")).resolve()
+    work = runner_temp / f"abicheck-main-v2-{target}"
+    if work.exists(): shutil.rmtree(work)
+    work.mkdir(parents=True)
+    src = work / "src"; build = work / "build"; install = work / "install"
+    pack = Path(os.environ.get("ABICHECK_INPUTS_DIR", str(work / "abicheck_inputs"))).resolve()
+    pack.mkdir(parents=True, exist_ok=True)
+    cache = work / "abicheck-cache"; cache.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["ABICHECK_INPUTS_DIR"] = str(pack)
+    env["ABICHECK_L4_CACHE_DIR"] = str(cache / "l4")
+    env["XDG_CACHE_HOME"] = str(cache / "xdg")
+    env.setdefault("ABICHECK_L4_JOBS", "1")
+    env.setdefault("ABICHECK_CALL_GRAPH_JOBS", "1")
+    env.setdefault("ABICHECK_PATTERN_SCAN_JOBS", "2")
+    env.setdefault("ABICHECK_L4_JOB_MEM_GIB", "3.0")
+    plugin_flags = os.environ.get("ABICHECK_PLUGIN_FLAGS", "").strip()
+    timings: list[CommandRecord] = []
+    errors: list[str] = []
+    summary: dict[str, Any] = {
+        "target": target, "status": "failed", "abicheck_main_sha": args.abicheck_sha,
+        "abicheck_version": simple_output(["abicheck", "--version"]),
+        "upstream_repo": TARGET_SPECS[target]["repo"], "upstream_ref": TARGET_SPECS[target]["ref"],
+        "compiler": "clang", "ast_frontend": "clang", "source_depth": "source",
+        "build_integration_producer": "clang-plugin", "errors": errors,
+    }
+    started = now_iso(); summary["started_at"] = started
+    collect_environment(out, args.abicheck_sha)
+    (out / "build_integration_config.json").write_text(json.dumps({
+        "producer": "clang-plugin", "plugin_so": os.environ.get("ABICHECK_PLUGIN_SO"),
+        "producer_version": os.environ.get("ABICHECK_PRODUCER_VERSION"),
+        "plugin_flags": plugin_flags, "pack": str(pack),
+        "public_roots_expected": TARGET_SPECS[target]["public_roots"],
