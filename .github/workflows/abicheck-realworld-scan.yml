@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        target: [onedal]
+        target: [onetbb]
     steps:
       - name: Checkout orchestration branch
         uses: actions/checkout@v4
@@ -59,9 +59,14 @@ jobs:
           ])
           if old not in text:
               raise SystemExit("oneDAL TBB include-shim patch target not found")
-          path.write_text(text.replace(old, new))
+          text = text.replace(old, new)
+          old_parse = '-std=gnu++17 -Wno-error -Wno-unknown-warning-option'
+          new_parse = '-std=gnu++17 -frtti -fexceptions -Wno-error -Wno-unknown-warning-option'
+          if text.count(old_parse) != 4:
+              raise SystemExit("unexpected header-parse option count")
+          path.write_text(text.replace(old_parse, new_parse))
           PY
-          echo "68e47d84eb2914c9d1d8b38b630472d88c64a796a17f66ea16be233a467104b6  ci/abicheck_realworld_scan.py" | sha256sum -c -
+          echo "b8504b6925c9e6333502b4625f33cc1c38ab65f6c9c0db768d66aedefc89c355  ci/abicheck_realworld_scan.py" | sha256sum -c -
           base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
           python -m py_compile ci/abicheck_realworld_scan.py ci/aggregate_abicheck.py
 
