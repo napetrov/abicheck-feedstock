@@ -1,0 +1,146 @@
+        raise HarnessError("compile_commands.json is not a list")
+    removed = 0
+    rewritten = 0
+    normalized: list[dict[str, Any]] = []
+    for entry in data:
+        e = dict(entry)
+        if isinstance(e.get("arguments"), list):
+            args, n = strip_plugin_tokens([str(x) for x in e["arguments"]])
+            e["arguments"] = args; removed += n
+        elif isinstance(e.get("command"), str):
+            args, n = strip_plugin_tokens(shlex.split(e["command"])); removed += n
+            e["command"] = shlex.join(args); rewritten += 1
+        normalized.append(e)
+    sanitized.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+    with raw.open("rb") as src_f, gzip.open(out / "compile_commands.raw.json.gz", "wb") as dst_f:
+        shutil.copyfileobj(src_f, dst_f)
+    with sanitized.open("rb") as src_f, gzip.open(out / "compile_commands.json.gz", "wb") as dst_f:
+        shutil.copyfileobj(src_f, dst_f)
+    summary = {
+        "entries": len(normalized), "plugin_tokens_removed": removed,
+        "command_entries_rewritten": rewritten, "raw_path": str(raw),
+        "sanitized_path": str(sanitized), "raw_sha256": sha256_file(raw),
+        "sanitized_sha256": sha256_file(sanitized),
+    }
+    write_json(out / "compile_db_sanitization.json", summary)
+    return summary
+
+
+def summarize_compile_db(path: Path, out: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    compilers: dict[str, int] = {}
+    languages: dict[str, int] = {}
+    sources: set[str] = set()
+    for e in data:
+        argv = e.get("arguments")
+        if not argv:
+            try: argv = shlex.split(e.get("command", ""))
+            except ValueError: argv = []
+        compiler = str(argv[0]) if argv else ""
+        compilers[compiler] = compilers.get(compiler, 0) + 1
+        source = str(e.get("file", "")); sources.add(source)
+        suffix = Path(source).suffix.lower()
+        lang = "c++" if suffix in {".cc", ".cpp", ".cxx", ".c++", ".mm"} else "c"
+        languages[lang] = languages.get(lang, 0) + 1
+    result = {
+        "path": str(path), "entries": len(data), "unique_sources": len(sources),
+        "compilers": compilers, "languages": languages, "sha256": sha256_file(path),
+    }
+    write_json(out / "compile_db_summary.json", result)
+    return result
+
+
+def validate_inputs_pack(pack: Path, out: Path, expected_compile_units: int) -> dict[str, Any]:
+    result: dict[str, Any] = {"path": str(pack), "status": "invalid", "tu_count": 0, "expected_compile_units": expected_compile_units}
+    try:
+        from abicheck.buildsource.inputs_validate import validate_inputs_pack as _validate
+        report = _validate(pack)
+        ratio = (float(report.tu_count) / expected_compile_units) if expected_compile_units else 0.0
+        result.update({
+            "errors": list(report.errors), "warnings": list(report.warnings),
+            "tu_count": int(report.tu_count), "compile_unit_coverage_ratio": round(ratio, 6),
+            "status": "valid" if not report.errors and report.tu_count > 0 and ratio >= 0.80 else "invalid",
+        })
+        if expected_compile_units and ratio < 0.80:
+            result.setdefault("errors", []).append(
+                f"build-integration pack covers only {report.tu_count}/{expected_compile_units} compile units ({ratio:.1%}); expected at least 80%"
+            )
+    except Exception as exc:
+        result["exception"] = f"{type(exc).__name__}: {exc}"
+    manifest = pack / "manifest.json"
+    if manifest.exists():
+        try: result["manifest"] = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception as exc: result["manifest_error"] = str(exc)
+    files = [p for p in pack.rglob("*") if p.is_file()]
+    result["files"] = len(files)
+    result["bytes"] = sum(p.stat().st_size for p in files)
+    write_json(out / "build_integration_pack_summary.json", result)
+    return result
+
+
+def archive_pack(pack: Path, out: Path, logs: Path, timings: list[CommandRecord], env: dict[str, str]) -> dict[str, Any]:
+    result: dict[str, Any] = {"status": "missing"}
+    if not pack.exists():
+        return result
+    archive = out / "abicheck_inputs.tar.zst"
+    rec = run_timed(
+        name="archive-build-integration-pack",
+        command=["tar", "--zstd", "-cf", str(archive), "-C", str(pack.parent), pack.name],
+        cwd=pack.parent, logs=logs, timings=timings, env=env, timeout=3600, check=False,
+    )
+    if archive.exists():
+        result = {
+            "status": "present", "archive": archive.name, "archive_returncode": rec.returncode,
+            "archive_size_bytes": archive.stat().st_size, "archive_sha256": sha256_file(archive),
+        }
+    return result
+
+
+def is_elf_shared(path: Path) -> bool:
+    try:
+        with path.open("rb") as f: magic = f.read(4)
+    except OSError:
+        return False
+    if magic != b"\x7fELF":
+        return False
+    text = simple_output(["readelf", "-h", str(path)], timeout=30)
+    return "DYN (Shared object file)" in text or "Type:                              DYN" in text
+
+
+def locate_libraries(target: str, build: Path, install: Path) -> tuple[list[Path], list[dict[str, Any]]]:
+    candidates: list[Path] = []
+    for root in (install, build):
+        if not root.exists(): continue
+        for p in root.rglob("*.so*"):
+            if not (p.is_file() and not p.is_symlink() and is_elf_shared(p)):
+                continue
+            if target == "onedal" and (p.name.startswith("libtbb") or p.name.startswith("libopenblas")):
+                continue
+            if target == "onetbb" and p.name.startswith("libtbbbind"):
+                continue
+            candidates.append(p)
+    unique: list[Path] = []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for p in sorted(candidates, key=lambda x: (x.name, str(x))):
+        digest = sha256_file(p)
+        if digest in seen: continue
+        seen.add(digest); unique.append(p)
+        dyn = simple_output(["readelf", "-d", str(p)], timeout=60)
+        soname_m = re.search(r"\(SONAME\).*\[(.*?)\]", dyn)
+        notes = simple_output(["readelf", "-n", str(p)], timeout=60)
+        build_id_m = re.search(r"Build ID: ([0-9a-fA-F]+)", notes)
+        sections = simple_output(["readelf", "-S", "--wide", str(p)], timeout=60)
+        symbols = simple_output(["nm", "-D", "--defined-only", str(p)], timeout=120)
+        rows.append({
+            "path": str(p), "name": p.name, "size_bytes": p.stat().st_size,
+            "sha256": digest, "soname": soname_m.group(1) if soname_m else None,
+            "build_id": build_id_m.group(1) if build_id_m else None,
+            "has_dwarf": ".debug_info" in sections,
+            "defined_dynamic_symbols": len([x for x in symbols.splitlines() if x.strip()]),
+        })
+    return unique, rows
+
+
+def write_elf_metadata(libraries: list[Path], rows: list[dict[str, Any]], out: Path) -> None:
+    elf_root = out / "elf"; elf_root.mkdir(parents=True, exist_ok=True)
