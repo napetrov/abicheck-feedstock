@@ -1,0 +1,140 @@
+    for p, row in zip(libraries, rows):
+        d = elf_root / f"{p.name}-{row['sha256'][:12]}"; d.mkdir(parents=True, exist_ok=True)
+        commands = {
+            "file.txt": ["file", "-L", str(p)],
+            "readelf-header.txt": ["readelf", "-h", str(p)],
+            "readelf-dynamic.txt": ["readelf", "-d", str(p)],
+            "readelf-notes.txt": ["readelf", "-n", str(p)],
+            "readelf-sections.txt": ["readelf", "-S", "--wide", str(p)],
+            "readelf-symbols.txt": ["readelf", "--dyn-syms", "--wide", str(p)],
+            "nm-defined.txt": ["nm", "-D", "--defined-only", "--with-symbol-versions", str(p)],
+            "nm-undefined.txt": ["nm", "-D", "--undefined-only", "--with-symbol-versions", str(p)],
+            "ldd.txt": ["ldd", str(p)],
+        }
+        for name, cmd in commands.items():
+            (d / name).write_text(simple_output(cmd, timeout=180) + "\n", encoding="utf-8")
+        row["metadata_dir"] = str(d.relative_to(out))
+    write_json(out / "libraries.json", rows)
+    write_json(out / "library_paths.json", [str(p) for p in libraries])
+
+
+def manifest_tree(root: Path, output_gz: Path) -> dict[str, Any]:
+    files = 0; dirs = 0; symlinks = 0; total = 0
+    with gzip.open(output_gz, "wt", encoding="utf-8") as f:
+        if root.exists():
+            for p in sorted(root.rglob("*")):
+                try:
+                    st = p.lstat()
+                    rel = str(p.relative_to(root))
+                    if p.is_symlink():
+                        kind = "symlink"; symlinks += 1; target = os.readlink(p)
+                    elif p.is_dir():
+                        kind = "directory"; dirs += 1; target = None
+                    elif p.is_file():
+                        kind = "file"; files += 1; total += st.st_size; target = None
+                    else:
+                        kind = "other"; target = None
+                    row = {"path": rel, "kind": kind, "size_bytes": st.st_size, "mode": oct(st.st_mode & 0o7777)}
+                    if target is not None: row["target"] = target
+                    if kind == "file" and st.st_size <= 64 * 1024 * 1024: row["sha256"] = sha256_file(p)
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
+                except OSError as exc:
+                    f.write(json.dumps({"path": str(p), "error": str(exc)}) + "\n")
+    return {"root": str(root), "files": files, "directories": dirs, "symlinks": symlinks, "bytes": total, "manifest": output_gz.name}
+
+
+def nonempty_payload(value: Any) -> bool:
+    if value is None: return False
+    if isinstance(value, bool): return value
+    if isinstance(value, (str, bytes)): return bool(value)
+    if isinstance(value, Mapping): return any(nonempty_payload(v) for v in value.values())
+    if isinstance(value, Sequence): return any(nonempty_payload(v) for v in value)
+    return True
+
+
+def snapshot_validation(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {"path": str(path), "exists": path.exists(), "valid": False}
+    if not path.exists(): return result
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"; return result
+    bs = data.get("build_source") or {}
+    manifest = bs.get("manifest") or {}
+    coverage_rows = manifest.get("coverage") or []
+    coverage: dict[str, Any] = {}
+    if isinstance(coverage_rows, list):
+        for row in coverage_rows:
+            if isinstance(row, dict): coverage[str(row.get("layer"))] = row.get("status")
+    be = bs.get("build_evidence") or {}
+    units = be.get("compile_units") or []
+    sa = bs.get("source_abi") or {}
+    surface = sa.get("reachable_source_surface") or {} if isinstance(sa, dict) else {}
+    l4_entities = sum(len(v) for v in surface.values() if isinstance(v, (list, dict))) if isinstance(surface, dict) else 0
+    l4_edges = len(sa.get("source_edges") or []) if isinstance(sa, dict) else 0
+    l4_mappings = 0
+    if isinstance(sa, dict) and isinstance(sa.get("mappings"), dict):
+        l4_mappings = sum(len(v) for v in sa["mappings"].values() if isinstance(v, (list, dict)))
+    sg = bs.get("source_graph") or {}
+    graph_nodes = sg.get("nodes") or []
+    result.update({
+        "schema_version": data.get("schema_version"), "from_headers": bool(data.get("from_headers")),
+        "coverage": coverage, "l3_compile_units": len(units) if isinstance(units, (list, dict)) else 0,
+        "l4_entities": l4_entities, "l4_edges": l4_edges, "l4_mappings": l4_mappings,
+        "l4_nonempty": (l4_entities + l4_edges + l4_mappings) > 0,
+        "l5_nodes": len(graph_nodes) if isinstance(graph_nodes, (list, dict)) else 0,
+        "size_bytes": path.stat().st_size, "sha256": sha256_file(path),
+    })
+    bad_statuses = {"not_collected", "NOT_COLLECTED", None}
+    coverage_ok = all(coverage.get(k) not in bad_statuses for k in ("L3_build", "L4_source_abi", "L5_source_graph")) if coverage else True
+    result["valid"] = bool(
+        result["from_headers"] and result["l3_compile_units"] > 0 and result["l4_nonempty"]
+        and result["l5_nodes"] > 0 and coverage_ok
+    )
+    return result
+
+
+def scan_headers_for_library(target: str, src: Path, library: Path) -> list[Path]:
+    """Return the public umbrella(s) owned by this DSO, avoiding unrelated internal build modes."""
+    if target != "onetbb":
+        return public_headers(target, src)
+    name = library.name
+    if name.startswith("libtbbmalloc_proxy"):
+        rels = ["include/oneapi/tbb/tbbmalloc_proxy.h"]
+    elif name.startswith("libtbbmalloc"):
+        rels = ["include/oneapi/tbb/scalable_allocator.h"]
+    else:
+        rels = ["include/oneapi/tbb.h"]
+    return [src / rel for rel in rels if (src / rel).is_file()]
+
+
+def scan_gcc_option_tokens(target: str) -> list[str]:
+    # A compilation database spans mutually exclusive library-internal modes.
+    # L2 parses the public consumer surface, so explicitly undo producer-only
+    # oneTBB macros and restore the public C++ language features after DB flags.
+    if target == "onetbb":
+        return [
+            "-U__TBB_BUILD", "-U__TBBMALLOC_BUILD",
+            "-U__TBBMALLOCPROXY_BUILD", "-U__TBBBIND_BUILD",
+            "-U__TBB_USE_ITT_NOTIFY", "-frtti", "-fexceptions",
+        ]
+    return []
+
+
+def scan_include_dirs(target: str, src: Path, build: Path) -> list[Path]:
+    candidates: list[Path]
+    if target == "onedal":
+        candidates = [
+            src / "cpp", src / "cpp/daal/include", build / "work",
+            src.parent / "deps/tbb/include", src.parent / "deps/openblas/include",
+        ]
+    elif target == "onetbb":
+        candidates = [src / "include", build / "include"]
+    elif target == "onednn":
+        candidates = [src / "include", build / "include", build / "src"]
+    else:
+        candidates = [src / "include", build / "include"]
+    return list(dict.fromkeys(p.resolve() for p in candidates if p.exists()))
+
+
+def run_scans(
