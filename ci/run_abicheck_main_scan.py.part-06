@@ -1,0 +1,179 @@
+    lines = [
+        f"# abicheck main full-source scan: {summary.get('target')}",
+        "",
+        f"- Status: **{summary.get('status')}**",
+        f"- abicheck main SHA: `{summary.get('abicheck_main_sha')}`",
+        f"- abicheck version: `{summary.get('abicheck_version')}`",
+        f"- Upstream: `{summary.get('upstream_repo')}` @ `{summary.get('upstream_ref')}`",
+        f"- Upstream commit: `{summary.get('upstream_commit')}`",
+        f"- Clang build integration: `{summary.get('compile_db', {}).get('entries', 0)}` compile entries",
+        f"- Full source inventory: `{summary.get('source_inventory', {}).get('files', 0)}` C/C++ files",
+        f"- Public headers inventoried: `{summary.get('public_headers', {}).get('files', 0)}`",
+        f"- Unique ELF libraries scanned: `{summary.get('unique_library_count', 0)}`",
+        "",
+        "## Stage timings",
+        "",
+        "| Stage | Exit | Wall s | User s | System s | Peak RSS MiB |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for row in summary.get("timings", []):
+        metrics = row.get("time_metrics") or {}
+        lines.append(
+            "| {name} | {rc} | {wall} | {user} | {system} | {rss} |".format(
+                name=str(row.get("name", "")).replace("|", "\\|"),
+                rc=row.get("returncode", ""),
+                wall=row.get("wall_seconds", ""),
+                user=metrics.get("user_seconds", ""),
+                system=metrics.get("system_seconds", ""),
+                rss=metrics.get("max_rss_mib", ""),
+            )
+        )
+    lines += ["", "## Library scans", ""]
+    lines += [
+        "| Library | Exit | Wall s | Snapshot | L3 units | L5 nodes |",
+        "|---|---:|---:|---|---:|---:|",
+    ]
+    for row in summary.get("scans", []):
+        snap = row.get("snapshot") or {}
+        lines.append(
+            "| {lib} | {rc} | {wall} | {snapok} | {l3} | {l5} |".format(
+                lib=Path(str(row.get("library", ""))).name.replace("|", "\\|"),
+                rc=row.get("returncode", ""),
+                wall=row.get("wall_seconds", ""),
+                snapok="yes" if row.get("snapshot") else "no",
+                l3=snap.get("l3_compile_units", ""),
+                l5=snap.get("l5_nodes", ""),
+            )
+        )
+    errors = summary.get("errors") or []
+    if errors:
+        lines += ["", "## Errors", ""]
+        lines += [f"- {error}" for error in errors]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", choices=sorted(TARGETS), required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--abicheck-sha", required=True)
+    parser.add_argument("--jobs", type=int, default=int(os.environ.get("ABICHECK_BUILD_JOBS", "2")))
+    args = parser.parse_args()
+
+    target = TARGETS[args.target]
+    output = args.output_root.resolve() / target.name
+    if output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+    logs = output / "logs"
+    logs.mkdir()
+    work = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"abicheck-main-{target.name}"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    src = work / "src"
+    build = work / "build"
+    install = work / "install"
+    build.mkdir()
+    install.mkdir()
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "CC": shutil.which("clang") or "clang",
+            "CXX": shutil.which("clang++") or "clang++",
+            "ABICHECK_AST_FRONTEND": "clang",
+            "ABICHECK_MAIN_SHA": args.abicheck_sha,
+            "ABICHECK_L4_JOBS": os.environ.get("ABICHECK_L4_JOBS", "2"),
+            "ABICHECK_CALL_GRAPH_JOBS": os.environ.get("ABICHECK_CALL_GRAPH_JOBS", "2"),
+            "ABICHECK_PATTERN_SCAN_JOBS": os.environ.get("ABICHECK_PATTERN_SCAN_JOBS", "2"),
+            "ABICHECK_L4_CACHE_DIR": str(work / "l4-cache"),
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    timings: list[dict[str, Any]] = []
+    errors: list[str] = []
+    status = "failed"
+    compile_db_summary: dict[str, Any] = {}
+    source_summary: dict[str, Any] = {}
+    public_summary: dict[str, Any] = {}
+    all_library_paths: list[dict[str, Any]] = []
+    library_meta: list[dict[str, Any]] = []
+    scans: list[dict[str, Any]] = []
+    build_integration_summary: dict[str, Any] = {}
+    compile_db_sanitization: dict[str, Any] = {}
+    upstream_commit = ""
+    abicheck_version = ""
+
+    json_dump(output / "environment.json", machine_environment(args.abicheck_sha))
+    write_text(output / "abicheck-main-sha.txt", args.abicheck_sha + "\n")
+    version_proc = run_capture(["abicheck", "--version"])
+    abicheck_version = (version_proc.stdout + version_proc.stderr).strip()
+    write_text(output / "abicheck-version.txt", abicheck_version + "\n")
+    help_proc = run_capture(["abicheck", "dump", "--help"], timeout=60)
+    write_text(output / "abicheck-dump-help.txt", help_proc.stdout + help_proc.stderr)
+    import_proc = run_capture(
+        [sys.executable, "-c", "import abicheck; print(abicheck.__file__)"], timeout=30
+    )
+    write_text(output / "abicheck-import-path.txt", import_proc.stdout + import_proc.stderr)
+    freeze_proc = run_capture([sys.executable, "-m", "pip", "freeze"], timeout=120)
+    write_text(output / "pip-freeze.txt", freeze_proc.stdout + freeze_proc.stderr)
+    abicheck_source = Path(os.environ.get("ABICHECK_MAIN_SOURCE", ""))
+    if abicheck_source.exists():
+        actual_proc = run_capture(["git", "rev-parse", "HEAD"], cwd=abicheck_source)
+        actual_sha = actual_proc.stdout.strip()
+        show_proc = run_capture(
+            ["git", "show", "-s", "--format=fuller", "HEAD"], cwd=abicheck_source
+        )
+        write_text(
+            output / "abicheck-main-commit.txt",
+            show_proc.stdout + show_proc.stderr
+            + f"\nexpected_sha={args.abicheck_sha}\nactual_sha={actual_sha}\n",
+        )
+    else:
+        actual_sha = ""
+
+    try:
+        if actual_sha and actual_sha != args.abicheck_sha:
+            raise HarnessError(
+                f"installed abicheck checkout SHA mismatch: "
+                f"expected {args.abicheck_sha}, got {actual_sha}"
+            )
+        clone_target(target, src, env, logs, timings)
+        public_headers, public_dirs = resolve_public_inputs(target, src)
+        build_integration_pack = configure_build_integration(
+            target, src, work, public_dirs, env, output
+        )
+        commit_proc = run_capture(["git", "rev-parse", "HEAD"], cwd=src)
+        upstream_commit = commit_proc.stdout.strip()
+        write_text(output / "upstream-commit.txt", upstream_commit + "\n")
+        show_proc = run_capture(
+            ["git", "show", "-s", "--format=fuller", upstream_commit], cwd=src
+        )
+        write_text(output / "upstream-commit.txt", show_proc.stdout + show_proc.stderr)
+        timestamp_proc = run_capture(
+            ["git", "show", "-s", "--format=%ct", upstream_commit], cwd=src
+        )
+        if timestamp_proc.returncode == 0 and timestamp_proc.stdout.strip().isdigit():
+            env["SOURCE_DATE_EPOCH"] = timestamp_proc.stdout.strip()
+
+        if target.build_kind == "cmake":
+            raw_compile_db = build_cmake(
+                target, src, build, install, env, logs, timings, max(1, args.jobs)
+            )
+        else:
+            raw_compile_db = build_onedal(
+                target, src, work, build, install, env, logs, timings,
+                max(1, args.jobs), output,
+            )
+
+        # Stop build-time wrapper injection before post-build replay.  For
+        # oneDAL this also removes the PATH shims so abicheck invokes real Clang.
+        if "_ABICHECK_PRE_LAUNCHER_PATH" in env:
+            env["PATH"] = env.pop("_ABICHECK_PRE_LAUNCHER_PATH")
+        env["ABICHECK_CC_DISABLE"] = "1"
+
+        compile_db, compile_db_sanitization = sanitize_compile_db(
+            raw_compile_db, output
+        )
