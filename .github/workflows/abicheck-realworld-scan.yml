@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/abicheck-realworld-scan.yml"
-      - "ci/abicheck_realworld_scan.py.gz.b64"
+      - "ci/abicheck_realworld_scan.py.part-*"
       - "ci/aggregate_abicheck.py.gz.b64"
   workflow_dispatch:
 
@@ -29,11 +29,12 @@ jobs:
       - name: Checkout orchestration branch
         uses: actions/checkout@v4
 
-      - name: Expand orchestration scripts
+      - name: Expand and verify orchestration scripts
         shell: bash
         run: |
           set -euxo pipefail
-          base64 -d ci/abicheck_realworld_scan.py.gz.b64 | gzip -dc > ci/abicheck_realworld_scan.py
+          cat ci/abicheck_realworld_scan.py.part-* > ci/abicheck_realworld_scan.py
+          echo "9c300cf1242754497389a6cc03f15ad2a66949b9946c4f347f19576ed76896c2  ci/abicheck_realworld_scan.py" | sha256sum -c -
           base64 -d ci/aggregate_abicheck.py.gz.b64 | gzip -dc > ci/aggregate_abicheck.py
           python -m py_compile ci/abicheck_realworld_scan.py ci/aggregate_abicheck.py
 
